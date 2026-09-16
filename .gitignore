@@ -1,0 +1,27 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# 自动生成的数据/图片
+data/txdata/*.txt
+data/txdata/*.wfm
+data/rxdata/*.txt
+data/rxdata/*.wfm
+data/*.png
+data/*.txt
+data/*.ico
+
+# 每次运行的临时输出
+data/plots/
+data/records/
+
+# 编辑器/调试产生的临时文件
+*.bak
