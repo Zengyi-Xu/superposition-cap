@@ -25,3 +25,9 @@ data/records/
 
 # 编辑器/调试产生的临时文件
 *.bak
+
+# 低代码平台每次运行的临时输出
+data/lowcode_runs/
+
+# 打包/备份文件
+*.zip

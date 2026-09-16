@@ -77,6 +77,15 @@ OSC_SAMPLE_RATE = 2000e6          # :ACQUIRE:SRATE
 OSC_TIMEBASE_SCALE = 60e-6        # :TIMEBASE:SCALE
 
 # ---------------------------------------------------------------------------
+# M8190A 任意波形发生器（Keysight，TCP/IP 5025）
+# ---------------------------------------------------------------------------
+AWG_SAMPLE_RATE = AWG_SAMPLE * 1e6  # AWG 采样率（Hz），= 900 MSa/s
+AWG_VPP = 0.5                     # 输出幅度（Vpp）
+AWG_OUTPUT_ROUTE = "DAC"          # 输出路径: DC / AC / DAC
+# VISA 地址（把 localhost 换成 AWG 实际 IP）：
+AWG_VISA_ADDR = "TCPIP0::localhost::5025::SOCKET"
+
+# ---------------------------------------------------------------------------
 # 绘图 / 记录
 # ---------------------------------------------------------------------------
 PLOT_SHOW = False

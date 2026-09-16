@@ -171,7 +171,8 @@ def biterr(a: np.ndarray, b: np.ndarray) -> Tuple[int, float]:
     a, b = a[:n], b[:n]
     width = int(np.floor(np.log2(max(np.max(a), np.max(b))))) + 1 if n else 1
     width = max(width, 1)
-    ba = np.unpackbits(a.astype(np.uint64)[:, None].view(np.uint8), axis=1)[:, -width:]
-    bb = np.unpackbits(b.astype(np.uint64)[:, None].view(np.uint8), axis=1)[:, -width:]
+    shifts = np.arange(width - 1, -1, -1)
+    ba = (a[:, None] >> shifts) & 1
+    bb = (b[:, None] >> shifts) & 1
     err = int(np.count_nonzero(ba != bb))
     return err, err / (n * width) if n else 0.0

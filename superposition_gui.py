@@ -38,6 +38,7 @@ import matplotlib.pyplot as plt
 import config as cfg
 import main as main_flow
 import superposition_core as core
+import awg_m8190a
 from record import generate_run_id, save_record
 from oscilloscope import KeysightScope, ScopeError
 
@@ -945,19 +946,19 @@ class RunPanel(ttk.Frame):
         ttk.Label(opt, text="接收文件:", style="Card.TLabel"
                   ).grid(row=4, column=0, sticky=tk.W, padx=12, pady=4)
         self.rxfile_var = tk.StringVar(value="")
-        self.rxfile_entry = ttk.Entry(opt, textvariable=self.rxfile_var, width=20)
+        self.rxfile_entry = ttk.Entry(opt, textvariable=self.rxfile_var, width=16)
         self.rxfile_entry.grid(row=4, column=1, sticky=tk.W, padx=(4, 4), pady=4)
         self.rxfile_btn = ttk.Button(opt, text="浏览…", command=self._browse_rx)
-        self.rxfile_btn.grid(row=4, column=1, sticky=tk.E, padx=(4, 16), pady=4)
+        self.rxfile_btn.grid(row=4, column=2, sticky=tk.W, padx=(0, 16), pady=4)
 
         ttk.Label(opt, text="示波器地址:", style="Card.TLabel"
-                  ).grid(row=4, column=2, sticky=tk.W, padx=12, pady=4)
+                  ).grid(row=5, column=0, sticky=tk.W, padx=12, pady=4)
         self.oscaddr_var = tk.StringVar(value=cfg.OSC_VISA_ADDR)
         self.oscaddr_entry = ttk.Entry(opt, textvariable=self.oscaddr_var, width=24)
-        self.oscaddr_entry.grid(row=4, column=3, sticky=tk.W, padx=(4, 16), pady=4)
+        self.oscaddr_entry.grid(row=5, column=1, sticky=tk.W, padx=(4, 16), pady=4)
 
         btn_bar = tk.Frame(opt, bg=COLOR_CARD)
-        btn_bar.grid(row=5, column=0, columnspan=4, sticky=tk.W,
+        btn_bar.grid(row=6, column=0, columnspan=4, sticky=tk.W,
                      padx=12, pady=(4, 8))
         self.run_btn = ttk.Button(btn_bar, text="▶  运行仿真",
                                   style="Accent.TButton",
@@ -968,6 +969,38 @@ class RunPanel(ttk.Frame):
         self.quick_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.run_status = ttk.Label(btn_bar, text="就绪", style="DimCard.TLabel")
         self.run_status.pack(side=tk.LEFT, padx=16)
+
+        # ── AWG card ─────────────────────────────────────────────────
+        awg_card = ttk.LabelFrame(self, text=" M8190A 波形下载（CH1 = I 路，CH2 = Q 路） ")
+        awg_card.pack(fill=tk.X, padx=2, pady=(2, 8))
+
+        ttk.Label(awg_card, text="AWG 地址:", style="Card.TLabel"
+                  ).grid(row=0, column=0, sticky=tk.W, padx=12, pady=(8, 4))
+        self.awgaddr_var = tk.StringVar(value=cfg.AWG_VISA_ADDR)
+        ttk.Entry(awg_card, textvariable=self.awgaddr_var, width=36
+                  ).grid(row=0, column=1, sticky=tk.W, padx=(4, 16), pady=(8, 4))
+
+        ttk.Label(awg_card, text="幅度 Vpp:", style="Card.TLabel"
+                  ).grid(row=0, column=2, sticky=tk.W, padx=12, pady=(8, 4))
+        self.awgvpp_var = tk.DoubleVar(value=cfg.AWG_VPP)
+        tk.Spinbox(awg_card, from_=0.05, to=1.5, increment=0.05,
+                   textvariable=self.awgvpp_var, width=8
+                   ).grid(row=0, column=3, sticky=tk.W, padx=(4, 16), pady=(8, 4))
+
+        ttk.Label(awg_card, text="输出路径:", style="Card.TLabel"
+                  ).grid(row=0, column=4, sticky=tk.W, padx=12, pady=(8, 4))
+        self.awgroute_var = tk.StringVar(value=cfg.AWG_OUTPUT_ROUTE)
+        ttk.Combobox(awg_card, textvariable=self.awgroute_var,
+                     values=["DAC", "DC", "AC"], state="readonly", width=6
+                     ).grid(row=0, column=5, sticky=tk.W, padx=(4, 16), pady=(8, 4))
+
+        self.awg_dl_btn = ttk.Button(awg_card, text="⬇ 生成并下载双通道波形",
+                                     style="Accent.TButton",
+                                     command=self._start_awg_download)
+        self.awg_dl_btn.grid(row=0, column=6, sticky=tk.W, padx=(8, 4), pady=(8, 4))
+        self.awg_stop_btn = ttk.Button(awg_card, text="停止输出",
+                                       command=self._stop_awg)
+        self.awg_stop_btn.grid(row=0, column=7, sticky=tk.W, padx=(4, 12), pady=(8, 4))
 
         # ── Bottom: log card ─────────────────────────────────────────
         log_card = ttk.LabelFrame(self, text=" 运行日志 ")
@@ -1008,6 +1041,56 @@ class RunPanel(ttk.Frame):
             filetypes=[("Text 波形", "*.txt"), ("所有文件", "*.*")])
         if path:
             self.rxfile_var.set(path)
+
+    def _start_awg_download(self):
+        if self._thread is not None and self._thread.is_alive():
+            messagebox.showinfo("忙", "已有任务在运行，请等待完成。")
+            return
+        self.awg_dl_btn.configure(state=tk.DISABLED)
+        self._append_log("\n===== 开始生成并下载 AWG 双通道波形 =====\n", "head")
+        self._thread = threading.Thread(target=self._awg_thread, daemon=True)
+        self._thread.start()
+        self.after(100, self._poll)
+
+    def _awg_thread(self):
+        try:
+            datano = self.datano_var.get()
+            seed = self.seed_var.get()
+            dec1, dec2 = core.generate_pam4_streams(datano, seed, seed + 100)
+            v1 = core.pam4_to_pam6(dec1)
+            v2 = core.pam4_to_pam6(dec2)
+            tx = core.generate_tx(v1, v2)
+            self._queue.put(("log",
+                             f"发射波形已生成: 符号数={datano}, 种子={seed}, "
+                             f"采样率={cfg.AWG_SAMPLE} MSa/s"))
+            awg_m8190a.download_two_channels(
+                tx["data1"], tx["data2"],
+                vpp=self.awgvpp_var.get(),
+                visa_addr=self.awgaddr_var.get().strip(),
+                output_route=self.awgroute_var.get(),
+                log=lambda msg: self._queue.put(("log", msg)),
+            )
+            self._queue.put(("awg_done", None))
+        except Exception as exc:
+            self._queue.put(("awg_error", exc))
+
+    def _stop_awg(self):
+        if self._thread is not None and self._thread.is_alive():
+            messagebox.showinfo("忙", "下载任务进行中，请等待完成后再停止。")
+            return
+
+        def _do_stop():
+            try:
+                with awg_m8190a.M8190AController(
+                        visa_addr=self.awgaddr_var.get().strip(),
+                        log=lambda msg: self._queue.put(("log", msg))) as awg:
+                    awg.stop()
+            except Exception as exc:
+                self._queue.put(("log", f"停止输出失败: {exc}"))
+
+        self._append_log("\n===== 停止 AWG 输出 =====\n", "head")
+        threading.Thread(target=_do_stop, daemon=True).start()
+        self.after(100, self._poll)
 
     def _append_log(self, text, tag=None):
         self.log_text.configure(state=tk.NORMAL)
@@ -1071,6 +1154,12 @@ class RunPanel(ttk.Frame):
                     self._append_log("\n========== Simulation Completed ==========\n", "head")
                     self._on_done(payload)
                     return
+                elif kind == "awg_done":
+                    self._append_log("\n===== AWG 下载完成 =====\n", "head")
+                    self.awg_dl_btn.configure(state=tk.NORMAL)
+                elif kind == "awg_error":
+                    self._append_log(f"\nAWG 错误: {payload}\n", "err")
+                    self.awg_dl_btn.configure(state=tk.NORMAL)
         except queue.Empty:
             pass
         if self._thread is not None and self._thread.is_alive():
@@ -1173,8 +1262,8 @@ class ScopePanel(ttk.Frame):
         self.log_text.configure(yscrollcommand=lsb.set)
         self.log_text.tag_configure("head", foreground="#22D3EE")
         self.log_text.tag_configure("err", foreground="#F87171")
-        self._append_log("提示：输入 VISA 地址（如 TCPIP0::169.254.140.83::5025::SOCKET）后点击“连接”。\n",
-                         "head")
+        self._log("提示：输入 VISA 地址（如 TCPIP0::169.254.140.83::5025::SOCKET）后点击“连接”。\n",
+                  "head")
 
     # ------------------------------------------------------------------
     def _log(self, text: str, tag: Optional[str] = None):
@@ -1371,6 +1460,14 @@ class SuperpositionGuiApp(tk.Tk):
 
         self.notebook.select(3)
 
+        # 菜单：工具 -> 低代码编辑器
+        menubar = tk.Menu(self)
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        tools_menu.add_command(label="低代码流程编辑器",
+                               command=self._launch_lowcode)
+        menubar.add_cascade(label="工具", menu=tools_menu)
+        self.config(menu=menubar)
+
         self.status_var = tk.StringVar()
         status = tk.Label(self, textvariable=self.status_var, anchor=tk.W,
                           bg=COLOR_BG, fg=COLOR_TEXT_DIM, bd=0,
@@ -1380,6 +1477,17 @@ class SuperpositionGuiApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.reload_data()
+
+    def _launch_lowcode(self):
+        """启动低代码流程编辑器（独立窗口）。"""
+        import subprocess
+        import sys
+        try:
+            subprocess.Popen(
+                [sys.executable, str(cfg.BASE_DIR / "lowcode_app.py")],
+                cwd=str(cfg.BASE_DIR))
+        except Exception as exc:
+            messagebox.showerror("启动失败", str(exc))
 
     def reload_data(self, select_latest=False):
         self.records = list_records()
