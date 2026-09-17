@@ -37,6 +37,7 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 
 import config as cfg
+import datetime
 import main as main_flow
 import superposition_core as core
 import awg_m8190a
@@ -1007,6 +1008,12 @@ class RunPanel(ttk.Frame):
         self._queue = queue.Queue()
         self._thread: Optional[threading.Thread] = None
 
+        # 运行日志持久化：所有写入 GUI 日志的文本同时追加到 data/log/gui_run.log
+        log_dir = cfg.BASE_DIR / "log"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        self._log_path = log_dir / "gui_run.log"
+        self._log_file = open(self._log_path, "a", encoding="utf-8", buffering=1)
+
         # 左右分栏：左侧可滚动（参数/AWG/优化卡片），右侧固定运行日志；分隔条可拖动
         paned = tk.PanedWindow(self, orient=tk.HORIZONTAL, bg=COLOR_BG,
                                sashwidth=5, sashrelief=tk.FLAT, bd=0)
@@ -1894,6 +1901,13 @@ class RunPanel(ttk.Frame):
             self.log_text.insert(tk.END, text)
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.DISABLED)
+        if self._log_file is not None and not self._log_file.closed:
+            try:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self._log_file.write(f"[{timestamp}] {text}")
+                self._log_file.flush()
+            except Exception:
+                pass
 
     def start_run(self):
         if self._thread is not None and self._thread.is_alive():
@@ -2326,6 +2340,11 @@ class SuperpositionGuiApp(tk.Tk):
         try:
             if hasattr(self, "panel_smu"):
                 self.panel_smu.on_close()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "panel_run") and self.panel_run._log_file is not None:
+                self.panel_run._log_file.close()
         except Exception:
             pass
         self.destroy()
