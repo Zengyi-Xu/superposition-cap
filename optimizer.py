@@ -147,6 +147,8 @@ def run_lms_sweep(
     snr_db: float = cfg.SNR_DB,
     modulation_mode: str = cfg.MODULATION_MODE,
     numof_ts: int = cfg.NUMOF_TS,
+    awg_sample_rate_ms: Optional[float] = None,
+    upsampleno: int = cfg.UPSAMPLENO,
     taps_range: Tuple[int, int, int] = (3, 31, 4),
     mu1_range: Tuple[float, float, int] = (1e-4, 1e-1, 5),
     mu2_range: Tuple[float, float, int] = (1e-4, 1e-1, 5),
@@ -169,8 +171,9 @@ def run_lms_sweep(
     _to_log(f"[{run_id}] 开始 LMS 参数扫描: {modulation_mode}, datano={datano}, seed={seed}", log)
 
     # ---- 生成发射信号（只做一次）----
-    v1, v2, decimal1, decimal2 = core.generate_symbols(modulation_mode, datano, seed, seed + 100)
-    tx = core.generate_tx(v1, v2)
+    v1, v2, decimal1, decimal2 = core.generate_symbols(
+        modulation_mode, datano, seed, seed + 100, upsampleno=upsampleno)
+    tx = core.generate_tx(v1, v2, upsampleno=upsampleno)
     tx_paths = _save_tx_files(run_id, v1, v2, decimal1, decimal2, tx)
     _to_log(f"发射波形已保存: txI_{run_id}.txt, txQ_{run_id}.txt", log)
 
@@ -181,7 +184,7 @@ def run_lms_sweep(
             f"接收文件 {Path(rx_file).name} 是多列数据，看起来是均衡结果 (eq_*.txt)。"
             f"离线优化需要选择原始接收波形文件 (rx_*.txt)。"
         )
-    expected_len = datano * cfg.UPSAMPLENO
+    expected_len = datano * upsampleno
     if len(rx_raw) < expected_len:
         raise ValueError(
             f"接收文件 {Path(rx_file).name} 长度 {len(rx_raw)} 小于期望的原始波形长度 "
@@ -194,7 +197,7 @@ def run_lms_sweep(
     _to_log(f"xcorr 同步: 偏移 {offset} 点", log)
 
     data_recover = core.downconvert_to_symbols(
-        datarx, tx["cos1"], tx["sin1"], tx["filter_cos"], cfg.UPSAMPLENO, 0
+        datarx, tx["cos1"], tx["sin1"], tx["filter_cos"], upsampleno, 0
     )
     datarx1 = np.real(data_recover)
     datarx2 = np.imag(data_recover)
@@ -231,7 +234,7 @@ def run_lms_sweep(
             best_ber = res["ber_avg"]
             best_record = {
                 "run_id": run_id,
-                "mode": "superposed",
+                "mode": modulation_mode,
                 "modulation_mode": modulation_mode,
                 "data_source": "file",
                 "datano": datano,
@@ -308,6 +311,7 @@ def run_lms_coordinate_search(
     modulation_mode: str = cfg.MODULATION_MODE,
     numof_ts: int = cfg.NUMOF_TS,
     awg_sample_rate_ms: Optional[float] = None,
+    upsampleno: int = cfg.UPSAMPLENO,
     taps_range: Tuple[int, int, int] = (3, 31, 4),
     mu1_range: Tuple[float, float, int] = (1e-4, 1e-1, 5),
     mu2_range: Tuple[float, float, int] = (1e-4, 1e-1, 5),
@@ -356,14 +360,18 @@ def run_lms_coordinate_search(
     )
 
     # ---- 生成发射信号（只做一次）----
-    v1, v2, decimal1, decimal2 = core.generate_symbols(modulation_mode, datano, seed, seed + 100)
-    tx = core.generate_tx(v1, v2)
+    v1, v2, decimal1, decimal2 = core.generate_symbols(
+        modulation_mode, datano, seed, seed + 100, upsampleno=upsampleno)
+    tx = core.generate_tx(v1, v2, upsampleno=upsampleno)
     tx_paths = _save_tx_files(run_id, v1, v2, decimal1, decimal2, tx)
     _to_log(f"发射波形已保存: txI_{run_id}.txt, txQ_{run_id}.txt", log)
 
     mod_params = core.get_modulation_params(modulation_mode)
-    bits_per_symbol = 2 * int(mod_params["bits_per_dim"])
-    upsampleno = cfg.UPSAMPLENO
+    bits_per_symbol = (
+        int(mod_params.get("bits_i", mod_params["bits_per_dim"])) +
+        int(mod_params.get("bits_q", mod_params["bits_per_dim"]))
+    )
+    upsampleno = int(upsampleno)
     bandwidth_mhz = (awg_sample_rate_ms or cfg.AWG_SAMPLE) / upsampleno
     data_rate_mbps = bandwidth_mhz * bits_per_symbol
     _to_log(f"带宽: {bandwidth_mhz:.1f} MHz "
@@ -378,7 +386,7 @@ def run_lms_coordinate_search(
             f"接收文件 {Path(rx_file).name} 是多列数据，看起来是均衡结果 (eq_*.txt)。"
             f"离线优化需要选择原始接收波形文件 (rx_*.txt)。"
         )
-    expected_len = datano * cfg.UPSAMPLENO
+    expected_len = datano * upsampleno
     if len(rx_raw) < expected_len:
         raise ValueError(
             f"接收文件 {Path(rx_file).name} 长度 {len(rx_raw)} 小于期望的原始波形长度 "
@@ -391,7 +399,7 @@ def run_lms_coordinate_search(
     _to_log(f"xcorr 同步: 偏移 {offset} 点", log)
 
     data_recover = core.downconvert_to_symbols(
-        datarx, tx["cos1"], tx["sin1"], tx["filter_cos"], cfg.UPSAMPLENO, 0
+        datarx, tx["cos1"], tx["sin1"], tx["filter_cos"], upsampleno, 0
     )
     datarx1 = np.real(data_recover)
     datarx2 = np.imag(data_recover)
@@ -405,7 +413,7 @@ def run_lms_coordinate_search(
     def _make_record(taps: int, mu1: float, mu2: float, res: Dict) -> Dict:
         return {
             "run_id": run_id,
-            "mode": "superposed",
+            "mode": "36QAM",
             "modulation_mode": modulation_mode,
             "data_source": "file",
             "datano": datano,

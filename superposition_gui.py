@@ -3,7 +3,7 @@
 
 Six tabs:
     1. Waveform & Spectrum    —— TX/RX time-domain waveforms and spectra
-    2. Superposition Modulation —— superposed constellation and density plots
+    2. Superposition Modulation —— 36QAM constellation and density plots
     3. Transmission Results   —— experiment record table and run-history trend
     4. Run Test               —— run the transceiver from the GUI with live log output
     5. Oscilloscope           —— TCP/IP control of the Keysight oscilloscope
@@ -311,9 +311,10 @@ def _regen_symbols(rec, max_count=5000):
     """Regenerate the TX constellation (v1 + 1j*v2) for a record."""
     seed = int(rec.get("seed", cfg.SEED_BAND1))
     datano = int(rec.get("datano", cfg.DATANO))
-    mode = rec.get("modulation_mode", core.MODULATION_SUPERPOSED)
+    mode = rec.get("modulation_mode", core.MODULATION_36QAM)
     v1, v2, _, _ = core.generate_symbols(
-        mode, min(datano, max_count), seed, seed + 100)
+        mode, min(datano, max_count), seed, seed + 100,
+        upsampleno=int(rec.get("upsampleno", cfg.UPSAMPLENO)))
     return v1 + 1j * v2
 
 
@@ -428,7 +429,7 @@ def build_tx_constellation(fig, run_id, title):
 
 def _constellation_axis_limit(mode: str) -> int:
     """根据调制模式返回星座图坐标轴范围。"""
-    if mode == core.MODULATION_SUPERPOSED:
+    if mode == core.MODULATION_36QAM:
         return int(np.log2(cfg.PAM_ORDER)) * 2 + 2  # 6
     params = core.get_modulation_params(mode)
     return int(np.max(np.abs(params["levels"]))) + 2
@@ -437,7 +438,7 @@ def _constellation_axis_limit(mode: str) -> int:
 def build_rx_constellation(fig, run_id, title):
     rec = _get_record(run_id)
     iq = _load_eq_symbols(rec)
-    mode = rec.get("modulation_mode", core.MODULATION_SUPERPOSED)
+    mode = rec.get("modulation_mode", core.MODULATION_36QAM)
     ax = fig.add_subplot(111)
     if iq is not None and len(iq):
         ax.plot(iq.real, iq.imag, "b.", alpha=0.4, markersize=4)
@@ -1000,7 +1001,7 @@ class ResultsPanel(ttk.Frame):
 
 
 class RunPanel(ttk.Frame):
-    """Tab 4: run the superposed transceiver from the GUI with live log output."""
+    """Tab 4: run the 36QAM / QAM transceiver from the GUI with live log output."""
 
     def __init__(self, parent, app):
         super().__init__(parent)
@@ -1081,13 +1082,15 @@ class RunPanel(ttk.Frame):
         self.mod_combo.grid(row=0, column=3, sticky=tk.EW, padx=(2, 12), pady=(10, 4))
         self.mod_combo.bind("<<ComboboxSelected>>", self._on_mod_change)
 
-        ttk.Label(opt, text="符号数:", style="Card.TLabel"
+        ttk.Label(opt, text="上采样倍数:", style="Card.TLabel"
                   ).grid(row=0, column=4, sticky=tk.W, padx=(10, 2), pady=(10, 4))
-        self.datano_var = tk.IntVar(value=_setting_int("DATANO", cfg.DATANO))
-        self.datano_spin = tk.Spinbox(opt, from_=1024, to=1024 * 512, increment=1024,
-                                      textvariable=self.datano_var, width=12)
-        self.datano_spin.grid(row=0, column=5, sticky=tk.EW, padx=(2, 12), pady=(10, 4))
-        self._bind_spinbox(self.datano_spin, self.datano_var, "DATANO", int)
+        self.upsampleno_var = tk.IntVar(value=_setting_int("UPSAMPLENO", cfg.UPSAMPLENO))
+        self.upsampleno_spin = tk.Spinbox(opt, from_=1, to=16, increment=1,
+                                          textvariable=self.upsampleno_var, width=12)
+        self.upsampleno_spin.grid(row=0, column=5, sticky=tk.EW, padx=(2, 12), pady=(10, 4))
+        self._bind_spinbox(self.upsampleno_spin, self.upsampleno_var, "UPSAMPLENO", int)
+        self.upsampleno_var.trace_add("write", lambda *_: self._mark_awg_out_of_sync(
+            "上采样倍数已更改，请重新下载 AWG 波形"))
 
         ttk.Label(opt, text="随机种子:", style="Card.TLabel"
                   ).grid(row=1, column=0, sticky=tk.W, padx=(10, 2), pady=4)
@@ -1096,21 +1099,21 @@ class RunPanel(ttk.Frame):
         self.seed_spin.grid(row=1, column=1, sticky=tk.EW, padx=(2, 12), pady=4)
         self._bind_spinbox(self.seed_spin, self.seed_var, "SEED", int)
 
-        ttk.Label(opt, text="信噪比 (dB):", style="Card.TLabel"
+        ttk.Label(opt, text="符号数:", style="Card.TLabel"
                   ).grid(row=1, column=2, sticky=tk.W, padx=(10, 2), pady=4)
+        self.datano_var = tk.IntVar(value=_setting_int("DATANO", cfg.DATANO))
+        self.datano_spin = tk.Spinbox(opt, from_=1024, to=1024 * 512, increment=1024,
+                                      textvariable=self.datano_var, width=12)
+        self.datano_spin.grid(row=1, column=3, sticky=tk.EW, padx=(2, 12), pady=4)
+        self._bind_spinbox(self.datano_spin, self.datano_var, "DATANO", int)
+
+        ttk.Label(opt, text="信噪比 (dB):", style="Card.TLabel"
+                  ).grid(row=1, column=4, sticky=tk.W, padx=(10, 2), pady=4)
         self.snr_var = tk.DoubleVar(value=_setting_float("SNR_DB", cfg.SNR_DB))
         self.snr_spin = tk.Spinbox(opt, from_=0.0, to=50.0, increment=0.5,
                                    textvariable=self.snr_var, width=12)
-        self.snr_spin.grid(row=1, column=3, sticky=tk.EW, padx=(2, 12), pady=4)
+        self.snr_spin.grid(row=1, column=5, sticky=tk.EW, padx=(2, 12), pady=4)
         self._bind_spinbox(self.snr_spin, self.snr_var, "SNR_DB", float)
-
-        ttk.Label(opt, text="训练符号数:", style="Card.TLabel"
-                  ).grid(row=1, column=4, sticky=tk.W, padx=(10, 2), pady=4)
-        self.ts_var = tk.IntVar(value=_setting_int("NUMOF_TS", cfg.NUMOF_TS))
-        self.ts_spin = tk.Spinbox(opt, from_=100, to=20000, increment=100,
-                                  textvariable=self.ts_var, width=12)
-        self.ts_spin.grid(row=1, column=5, sticky=tk.EW, padx=(2, 12), pady=4)
-        self._bind_spinbox(self.ts_spin, self.ts_var, "NUMOF_TS", int)
 
         ttk.Label(opt, text="LMS 抽头数:", style="Card.TLabel"
                   ).grid(row=2, column=0, sticky=tk.W, padx=(10, 2), pady=4)
@@ -1136,35 +1139,43 @@ class RunPanel(ttk.Frame):
         self.mu2_spin.grid(row=2, column=5, sticky=tk.EW, padx=(2, 12), pady=4)
         self._bind_spinbox(self.mu2_spin, self.mu2_var, "LMS_MU2", float)
 
-        ttk.Label(opt, text="接收波形 (rx_*.txt):", style="Card.TLabel"
+        ttk.Label(opt, text="训练符号数:", style="Card.TLabel"
                   ).grid(row=3, column=0, sticky=tk.W, padx=(10, 2), pady=4)
+        self.ts_var = tk.IntVar(value=_setting_int("NUMOF_TS", cfg.NUMOF_TS))
+        self.ts_spin = tk.Spinbox(opt, from_=100, to=20000, increment=100,
+                                  textvariable=self.ts_var, width=12)
+        self.ts_spin.grid(row=3, column=1, sticky=tk.EW, padx=(2, 12), pady=4)
+        self._bind_spinbox(self.ts_spin, self.ts_var, "NUMOF_TS", int)
+
+        ttk.Label(opt, text="接收波形 (rx_*.txt):", style="Card.TLabel"
+                  ).grid(row=4, column=0, sticky=tk.W, padx=(10, 2), pady=4)
         self.rxfile_var = tk.StringVar(value=_setting_str("RX_FILE", ""))
         self.rxfile_entry = ttk.Entry(opt, textvariable=self.rxfile_var)
-        self.rxfile_entry.grid(row=3, column=1, columnspan=4, sticky=tk.EW,
+        self.rxfile_entry.grid(row=4, column=1, columnspan=4, sticky=tk.EW,
                                padx=(2, 4), pady=4)
         self._bind_entry(self.rxfile_entry, self.rxfile_var, "RX_FILE")
         self.rxfile_btn = ttk.Button(opt, text="浏览…", command=self._browse_rx)
-        self.rxfile_btn.grid(row=3, column=5, sticky=tk.EW, padx=(2, 12), pady=4)
+        self.rxfile_btn.grid(row=4, column=5, sticky=tk.EW, padx=(2, 12), pady=4)
 
         ttk.Label(opt, text="示波器地址:", style="Card.TLabel"
-                  ).grid(row=4, column=0, sticky=tk.W, padx=(10, 2), pady=4)
+                  ).grid(row=5, column=0, sticky=tk.W, padx=(10, 2), pady=4)
         self.oscaddr_var = tk.StringVar(value=_setting_str("OSC_VISA_ADDR", cfg.OSC_VISA_ADDR))
         self.oscaddr_entry = ttk.Entry(opt, textvariable=self.oscaddr_var)
-        self.oscaddr_entry.grid(row=4, column=1, columnspan=4, sticky=tk.EW,
+        self.oscaddr_entry.grid(row=5, column=1, columnspan=4, sticky=tk.EW,
                                 padx=(2, 4), pady=4)
         self._bind_entry(self.oscaddr_entry, self.oscaddr_var, "OSC_VISA_ADDR",
                          on_save=lambda v: _persist_addresses(osc_addr=v))
         ttk.Button(opt, text="自动识别", command=self._auto_detect_scope
-                   ).grid(row=4, column=5, sticky=tk.EW, padx=(2, 12), pady=4)
+                   ).grid(row=5, column=5, sticky=tk.EW, padx=(2, 12), pady=4)
 
         ttk.Label(opt, text="示波器通道:", style="Card.TLabel"
-                  ).grid(row=5, column=0, sticky=tk.W, padx=(10, 2), pady=4)
+                  ).grid(row=6, column=0, sticky=tk.W, padx=(10, 2), pady=4)
         self.oscchan_var = tk.StringVar(value=_setting_str("OSC_CHANNEL", cfg.OSC_CHANNEL))
         self.oscchan_combo = ttk.Combobox(
             opt, textvariable=self.oscchan_var,
             values=["CHAN1", "CHAN2", "CHAN3", "CHAN4"],
             state="readonly", width=10)
-        self.oscchan_combo.grid(row=5, column=1, sticky=tk.EW, padx=(2, 12), pady=4)
+        self.oscchan_combo.grid(row=6, column=1, sticky=tk.EW, padx=(2, 12), pady=4)
         self.oscchan_combo.bind("<<ComboboxSelected>>",
                                 lambda _e: _persist_addresses(osc_channel=self.oscchan_var.get()))
 
@@ -1172,19 +1183,19 @@ class RunPanel(ttk.Frame):
         self.oscdual_check = ttk.Checkbutton(
             opt, text="双通道采集 (CH1+CH2)", variable=self.oscdual_var,
             command=self._on_oscdual_change)
-        self.oscdual_check.grid(row=5, column=2, columnspan=2, sticky=tk.W,
+        self.oscdual_check.grid(row=6, column=2, columnspan=2, sticky=tk.W,
                                 padx=(10, 2), pady=4)
 
         ttk.Label(opt, text="示波器采样率 (MSa/s):", style="Card.TLabel"
-                  ).grid(row=5, column=4, sticky=tk.W, padx=(10, 2), pady=4)
+                  ).grid(row=6, column=4, sticky=tk.W, padx=(10, 2), pady=4)
         self.oscsrate_var = tk.DoubleVar(value=_setting_float("OSC_SAMPLE", cfg.OSC_SAMPLE))
         self.oscsrate_spin = tk.Spinbox(opt, from_=100, to=10000, increment=100,
                                         textvariable=self.oscsrate_var, width=12)
-        self.oscsrate_spin.grid(row=5, column=5, sticky=tk.EW, padx=(2, 12), pady=4)
+        self.oscsrate_spin.grid(row=6, column=5, sticky=tk.EW, padx=(2, 12), pady=4)
         self._bind_spinbox(self.oscsrate_spin, self.oscsrate_var, "OSC_SAMPLE", float)
 
         btn_bar = tk.Frame(opt, bg=COLOR_CARD)
-        btn_bar.grid(row=6, column=0, columnspan=6, sticky=tk.W,
+        btn_bar.grid(row=7, column=0, columnspan=6, sticky=tk.W,
                      padx=10, pady=(6, 10))
         self.run_btn = ttk.Button(btn_bar, text="▶  运行仿真",
                                   style="Accent.TButton",
@@ -1577,11 +1588,13 @@ class RunPanel(ttk.Frame):
             datano = self.datano_var.get()
             seed = self.seed_var.get()
             mode = self.mod_var.get()
-            v1, v2, _, _ = core.generate_symbols(mode, datano, seed, seed + 100)
-            tx = core.generate_tx(v1, v2)
+            upsampleno = self.upsampleno_var.get()
+            v1, v2, _, _ = core.generate_symbols(
+                mode, datano, seed, seed + 100, upsampleno=upsampleno)
+            tx = core.generate_tx(v1, v2, upsampleno=upsampleno)
             self._queue.put(("log",
                              f"发射波形已生成: 调制={mode}, 符号数={datano}, 种子={seed}, "
-                             f"采样率={self.awgsrate_var.get()} MSa/s"))
+                             f"上采样={upsampleno}, 采样率={self.awgsrate_var.get()} MSa/s"))
             if self.awg_combine_var.get():
                 awg_m8190a.combine_and_download_single_channel(
                     tx["data1"], tx["data2"],
@@ -1634,6 +1647,7 @@ class RunPanel(ttk.Frame):
             "OSC_CHANNEL": self.oscchan_var.get(),
             "OSC_DUAL": self.oscdual_var.get(),
             "OSC_SAMPLE": self.oscsrate_var.get(),
+            "UPSAMPLENO": self.upsampleno_var.get(),
             "AWG_VISA_ADDR": self.awgaddr_var.get(),
             "AWG_SAMPLE_RATE": self.awgsrate_var.get(),
             "AWG_VPP_CH1": self.awgvpp_ch1_var.get(),
@@ -1728,6 +1742,7 @@ class RunPanel(ttk.Frame):
                 modulation_mode=self.mod_var.get(),
                 numof_ts=self.ts_var.get(),
                 awg_sample_rate_ms=self.awgsrate_var.get(),
+                upsampleno=self.upsampleno_var.get(),
                 taps_range=(
                     self.sweep_taps_min_var.get(),
                     self.sweep_taps_max_var.get(),
@@ -1863,9 +1878,10 @@ class RunPanel(ttk.Frame):
             datano = self.datano_var.get()
             seed = self.seed_var.get()
             mode = self.mod_var.get()
+            upsampleno = self.upsampleno_var.get()
             v1, v2, decimal1, decimal2 = core.generate_symbols(
-                mode, datano, seed, seed + 100)
-            tx = core.generate_tx(v1, v2)
+                mode, datano, seed, seed + 100, upsampleno=upsampleno)
+            tx = core.generate_tx(v1, v2, upsampleno=upsampleno)
             run_id = generate_run_id()
             tx1_path = cfg.TXDATA_DIR / f"txI_{run_id}.txt"
             tx2_path = cfg.TXDATA_DIR / f"txQ_{run_id}.txt"
@@ -1957,6 +1973,7 @@ class RunPanel(ttk.Frame):
                 osc_sample_rate_ms=self.oscsrate_var.get(),
                 awg_sample_rate_ms=self.awgsrate_var.get(),
                 modulation_mode=self.mod_var.get(),
+                upsampleno=self.upsampleno_var.get(),
                 run_id=run_id,
                 log=lambda msg: self._queue.put(("log", msg)),
             )
@@ -2086,8 +2103,10 @@ class RunPanel(ttk.Frame):
             datano = min(self.datano_var.get(), 5000)
             seed = self.seed_var.get()
             mode = self.mod_var.get()
-            v1, v2, _, _ = core.generate_symbols(mode, datano, seed, seed + 100)
-            tx = core.generate_tx(v1, v2)
+            upsampleno = self.upsampleno_var.get()
+            v1, v2, _, _ = core.generate_symbols(
+                mode, datano, seed, seed + 100, upsampleno=upsampleno)
+            tx = core.generate_tx(v1, v2, upsampleno=upsampleno)
             data = {"tx": tx["tx_sum"], "sym": v1 + 1j * v2,
                     "fs": cfg.AWG_SAMPLE * 1e6}
             self.app.show_quick_plots(data)
@@ -2256,7 +2275,7 @@ class SuperpositionGuiApp(tk.Tk):
                         if rate and awg and bw else
                         (f"{rate:.0f} Mbps" if rate else "N/A"))
             self.metrics_var.set(
-                f"模式 {rec.get('modulation_mode', 'superposed')} | "
+                f"模式 {rec.get('modulation_mode', '36QAM')} | "
                 f"符号数 {rec.get('datano', '-')} | "
                 f"种子 {rec.get('seed', '-')} | "
                 f"SNR {rec.get('snr_db', 0):.1f} dB | "

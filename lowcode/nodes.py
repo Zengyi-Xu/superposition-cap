@@ -136,7 +136,7 @@ def _fn_pam4_source(inputs, params, ctx):
 
 
 def _fn_symbol_source(inputs, params, ctx):
-    """通用符号序列源：支持 superposed/4QAM/16QAM/64QAM/36QAM_NLTCP。"""
+    """通用符号序列源：支持 36QAM/4QAM/16QAM/32QAM/64QAM。"""
     datano = int(params.get("datano", config.DATANO))
     seed = int(params.get("seed", config.SEED_BAND1))
     mode = str(params.get("modulation", config.MODULATION_MODE))
@@ -340,7 +340,7 @@ def _fn_pam6_decide(inputs, params, ctx):
 
 
 def _fn_symbol_decide(inputs, params, ctx):
-    """通用判决：按调制模式对恢复符号流进行判决（superposed 会差分解码回 PAM4）。"""
+    """通用判决：按调制模式对恢复符号流进行判决（36QAM 会差分解码回 PAM4）。"""
     recover = np.asarray(inputs["recover"])
     mode = str(params.get("modulation", config.MODULATION_MODE))
     dec1, dec2 = core.demodulate_symbols(recover, mode)
@@ -369,7 +369,7 @@ def _fn_ber(inputs, params, ctx):
 def _fn_ber_report(inputs, params, ctx):
     """一次性统计两路 BER（跳过 LMS 抽头边缘，与 main.py 一致）。
 
-    superposed 模式下输出 PAM6/PAM4 双层指标；其它模式输出单层 I/Q 支路指标。
+    36QAM 模式下输出 PAM6/PAM4 双层指标；其它模式输出单层 I/Q 支路指标。
     """
     recover = np.asarray(inputs["recover"])
     decimal1 = np.asarray(inputs["dec1_tx"]).ravel().astype(int)
@@ -386,7 +386,7 @@ def _fn_ber_report(inputs, params, ctx):
     _, ber2 = core.biterr(rx_dec2[sl], decimal2[sl])
     ber_avg = float(np.mean([ber1, ber2]))
 
-    if mode == core.MODULATION_SUPERPOSED:
+    if mode == core.MODULATION_36QAM:
         params6 = core.get_modulation_params(mode)
         dec6_1 = core.pam_demodulate(np.real(recover), params6["levels"])
         dec6_2 = core.pam_demodulate(np.imag(recover), params6["levels"])
@@ -558,7 +558,7 @@ def _register_all():
 
     register(NodeDef(
         "symbol_source", "通用符号源", "数据源",
-        "生成 superposed/4QAM/16QAM/64QAM/36QAM_NLTCP 的 I/Q 符号（同时输出索引与电平）",
+        "生成 36QAM/4QAM/16QAM/32QAM/64QAM 的 I/Q 符号（同时输出索引与电平）",
         [], [PortDef("dec1", "I 索引", "pam"),
              PortDef("dec2", "Q 索引", "pam"),
              PortDef("v1", "I 电平", "pam"),
@@ -691,7 +691,7 @@ def _register_all():
 
     register(NodeDef(
         "symbol_decide", "通用判决", "解调",
-        "按调制模式对恢复符号流判决（superposed 会解码回 PAM4）",
+        "按调制模式对恢复符号流判决（36QAM 会解码回 PAM4）",
         [PortDef("recover", "恢复符号流", "symbols")],
         [PortDef("dec1", "判决-1", "pam"), PortDef("dec2", "判决-2", "pam")],
         [ParamDef("modulation", "调制模式", "choice", config.MODULATION_MODE,

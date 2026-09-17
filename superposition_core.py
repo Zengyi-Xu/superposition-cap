@@ -49,15 +49,21 @@ def pam4_to_pam6(decimal_pam4: np.ndarray) -> np.ndarray:
 # -----------------------------------------------------------------------------
 # 调制模式支持（普通 QAM / NLTCP-QAM / 叠加 PAM）
 # -----------------------------------------------------------------------------
-MODULATION_SUPERPOSED = "superposed"
+MODULATION_36QAM = "36QAM"
 MODULATION_QAM4 = "4QAM"
 MODULATION_QAM16 = "16QAM"
+MODULATION_QAM32 = "32QAM"
 MODULATION_QAM64 = "64QAM"
 MODULATION_NLTCP36 = "36QAM_NLTCP"
 SUPPORTED_MODULATIONS = [
-    MODULATION_SUPERPOSED, MODULATION_QAM4,
-    MODULATION_QAM16, MODULATION_QAM64, MODULATION_NLTCP36,
+    MODULATION_36QAM, MODULATION_QAM4,
+    MODULATION_QAM16, MODULATION_QAM32, MODULATION_QAM64,
 ]
+
+
+def _bits_for_order(order: int) -> int:
+    """返回能编码 order 个电平所需的最少比特数（order 为 2 的幂时即 log2）。"""
+    return int(np.ceil(np.log2(order)))
 
 
 def _pam_levels(order: int) -> np.ndarray:
@@ -67,7 +73,7 @@ def _pam_levels(order: int) -> np.ndarray:
 
 def get_modulation_params(mode: str) -> dict:
     """返回指定调制模式的参数字典。"""
-    if mode == MODULATION_SUPERPOSED:
+    if mode == MODULATION_36QAM:
         return {
             "mode": mode,
             "is_superposed": True,
@@ -88,6 +94,15 @@ def get_modulation_params(mode: str) -> dict:
             "order_per_dim": 4, "levels": _pam_levels(4),
             "bits_per_dim": 2, "shaped": False,
         }
+    if mode == MODULATION_QAM32:
+        # 32QAM：I 路 4 电平(2bit)，Q 路 8 电平(3bit)，共 32 点、5 bit/符号
+        return {
+            "mode": mode, "is_superposed": False,
+            "order_i": 4, "order_q": 8,
+            "levels_i": _pam_levels(4), "levels_q": _pam_levels(8),
+            "bits_i": 2, "bits_q": 3,
+            "shaped": False,
+        }
     if mode == MODULATION_QAM64:
         return {
             "mode": mode, "is_superposed": False,
@@ -95,6 +110,7 @@ def get_modulation_params(mode: str) -> dict:
             "bits_per_dim": 3, "shaped": False,
         }
     if mode == MODULATION_NLTCP36:
+        # 保留对旧记录/旧流程的兼容，但不再在 GUI 下拉中提供
         return {
             "mode": mode, "is_superposed": False,
             "order_per_dim": 6, "levels": _pam_levels(6),
@@ -147,7 +163,8 @@ def generate_symbols(mode: str,
                      datano: int,
                      seed1: int = config.SEED_BAND1,
                      seed2: int = config.SEED_BAND2,
-                     shaping_lambda: float = config.NLTCP_SHAPING_FACTOR
+                     shaping_lambda: float = config.NLTCP_SHAPING_FACTOR,
+                     upsampleno: int = config.UPSAMPLENO,
                      ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """按指定调制模式生成发射符号。
 
@@ -159,13 +176,21 @@ def generate_symbols(mode: str,
         用于 BER 比对的十进制索引：superposed 模式下为 PAM4 索引，
         其它模式下为每维 PAM 索引（0..order_per_dim-1）。
     """
-    if mode == MODULATION_SUPERPOSED:
+    if mode == MODULATION_36QAM:
         decimal1, decimal2 = generate_pam4_streams(datano, seed1, seed2)
         v1 = pam4_to_pam6(decimal1)
         v2 = pam4_to_pam6(decimal2)
         return v1, v2, decimal1, decimal2
 
     params = get_modulation_params(mode)
+    if "order_i" in params and "order_q" in params:
+        # 非对称 I/Q 阶数（如 32QAM: 4×8）
+        decimal1, _ = generate_pam_streams_uniform(datano, params["order_i"], seed1, seed2)
+        _, decimal2 = generate_pam_streams_uniform(datano, params["order_q"], seed1, seed2)
+        v1 = pam_indices_to_levels(decimal1, params["order_i"])
+        v2 = pam_indices_to_levels(decimal2, params["order_q"])
+        return v1, v2, decimal1, decimal2
+
     order = int(params["order_per_dim"])
     if params["shaped"]:
         decimal1, decimal2 = generate_pam_streams_shaped(
@@ -176,6 +201,27 @@ def generate_symbols(mode: str,
     v1 = pam_indices_to_levels(decimal1, order)
     v2 = pam_indices_to_levels(decimal2, order)
     return v1, v2, decimal1, decimal2
+
+
+def generate_symbols_for_tx(mode: str,
+                            datano: int,
+                            seed1: int = config.SEED_BAND1,
+                            seed2: int = config.SEED_BAND2,
+                            shaping_lambda: float = config.NLTCP_SHAPING_FACTOR,
+                            upsampleno: int = config.UPSAMPLENO,
+                            ) -> Tuple[Dict, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """生成符号并直接产生发射波形（供 main.py / optimizer.py 使用）。
+
+    Returns
+    -------
+    tx : dict
+        generate_tx 返回的波形字典（含 cos1/sin1/filter_cos 等）。
+    v1, v2, decimal1, decimal2 : 与 generate_symbols 一致。
+    """
+    v1, v2, decimal1, decimal2 = generate_symbols(
+        mode, datano, seed1, seed2, shaping_lambda, upsampleno)
+    tx = generate_tx(v1, v2, upsampleno=upsampleno)
+    return tx, v1, v2, decimal1, decimal2
 
 
 def pam_demodulate(rxdata: np.ndarray, order_or_levels) -> np.ndarray:
@@ -196,7 +242,7 @@ def pam_demodulate(rxdata: np.ndarray, order_or_levels) -> np.ndarray:
 
 
 def demodulate_symbols(recoverdata: np.ndarray,
-                       mode: str = MODULATION_SUPERPOSED
+                       mode: str = MODULATION_36QAM
                        ) -> Tuple[np.ndarray, np.ndarray]:
     """按调制模式对接收回的复数符号流进行判决。
 
@@ -207,10 +253,14 @@ def demodulate_symbols(recoverdata: np.ndarray,
     rx1 = np.real(np.asarray(recoverdata))
     rx2 = np.imag(np.asarray(recoverdata))
     params = get_modulation_params(mode)
+    if mode == MODULATION_36QAM:
+        return pam6_to_pam4(dec1), pam6_to_pam4(dec2)
+    if "levels_i" in params and "levels_q" in params:
+        dec1 = pam_demodulate(rx1, params["levels_i"])
+        dec2 = pam_demodulate(rx2, params["levels_q"])
+        return dec1, dec2
     dec1 = pam_demodulate(rx1, params["levels"])
     dec2 = pam_demodulate(rx2, params["levels"])
-    if mode == MODULATION_SUPERPOSED:
-        return pam6_to_pam4(dec1), pam6_to_pam4(dec2)
     return dec1, dec2
 
 

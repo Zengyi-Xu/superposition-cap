@@ -24,12 +24,13 @@ for _d in (DATA_DIR, TXDATA_DIR, RXDATA_DIR, PLOT_DIR, RECORD_DIR):
 # 调制模式
 # ---------------------------------------------------------------------------
 # modulation_mode:
-#   "superposed"  = 功率域叠加 PAM4+PAM4 -> 类 16QAM（原默认，两路 PAM4 差分映射为 PAM6）
+#   "36QAM"       = 功率域叠加 PAM4+PAM4 -> PAM6×PAM6（原 "superposed"，每维 6 电平）
 #   "4QAM"        = 普通 4QAM（QPSK，每维 PAM2）
 #   "16QAM"       = 普通 16QAM（每维 PAM4）
+#   "32QAM"       = 非对称 32QAM（I 路 PAM4 × Q 路 PAM8，5 bit/符号）
 #   "64QAM"       = 普通 64QAM（每维 PAM8）
-#   "36QAM_NLTCP" = 36QAM + 概率整形（NLTCP，每维 PAM6，Maxwell-Boltzmann 分布）
-MODULATION_MODE = "superposed"
+#   "36QAM_NLTCP" = 36QAM + 概率整形（旧模式，仅兼容旧记录）
+MODULATION_MODE = "36QAM"
 NLTCP_SHAPING_FACTOR = 0.15       # 概率整形系数 λ，越大越偏向内圈星座点
 
 # ---------------------------------------------------------------------------

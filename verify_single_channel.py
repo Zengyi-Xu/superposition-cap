@@ -15,7 +15,7 @@ import awg_m8190a
 
 def verify_tx_sum():
     datano = 512
-    v1, v2, _, _ = core.generate_symbols(core.MODULATION_SUPERPOSED, datano,
+    v1, v2, _, _ = core.generate_symbols(core.MODULATION_36QAM, datano,
                                          cfg.SEED_BAND1, cfg.SEED_BAND2)
     tx = core.generate_tx(v1, v2)
     expected = tx["data1"] + tx["data2"]
@@ -25,7 +25,7 @@ def verify_tx_sum():
 
 def verify_combined_waveform():
     datano = 512
-    v1, v2, _, _ = core.generate_symbols(core.MODULATION_SUPERPOSED, datano,
+    v1, v2, _, _ = core.generate_symbols(core.MODULATION_36QAM, datano,
                                          cfg.SEED_BAND1, cfg.SEED_BAND2)
     tx = core.generate_tx(v1, v2)
     combined = np.asarray(tx["data1"], dtype=float) + np.asarray(tx["data2"], dtype=float)
@@ -46,7 +46,7 @@ def verify_single_port_receiver():
         lms_mu2=cfg.LMS_MU2,
         numof_ts=800,
         data_source="virtual",
-        modulation_mode=core.MODULATION_SUPERPOSED,
+        modulation_mode=core.MODULATION_36QAM,
         log=print,
     )
     assert record["ber_avg"] < 0.5, "平均 BER 异常，接收链路可能已损坏"

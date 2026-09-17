@@ -36,6 +36,7 @@ def run_experiment(datano: int = cfg.DATANO,
                    osc_dual: bool = False,
                    osc_sample_rate_ms: float = cfg.OSC_SAMPLE,
                    awg_sample_rate_ms: float = cfg.AWG_SAMPLE,
+                   upsampleno: int = cfg.UPSAMPLENO,
                    modulation_mode: str = cfg.MODULATION_MODE,
                    run_id: str = None,
                    log=print) -> dict:
@@ -44,12 +45,12 @@ def run_experiment(datano: int = cfg.DATANO,
         raise ValueError(f"不支持的调制模式: {modulation_mode!r}")
     run_id = run_id or generate_run_id()
     log(f"[{run_id}] 调制模式: {modulation_mode}  数据源: {data_source} "
-        f" 符号数: {datano}  种子: {seed}")
+        f" 符号数: {datano}  种子: {seed}  上采样: {upsampleno}")
 
     # ---- 发射（TX）----
     v1, v2, decimal1, decimal2 = core.generate_symbols(
-        modulation_mode, datano, seed, seed + 100)
-    tx = core.generate_tx(v1, v2)
+        modulation_mode, datano, seed, seed + 100, upsampleno=upsampleno)
+    tx = core.generate_tx(v1, v2, upsampleno=upsampleno)
 
     tx1_path = cfg.TXDATA_DIR / f"txI_{run_id}.txt"
     tx2_path = cfg.TXDATA_DIR / f"txQ_{run_id}.txt"
@@ -71,8 +72,11 @@ def run_experiment(datano: int = cfg.DATANO,
 
     # ---- 传输速率 ----
     mod_params = core.get_modulation_params(modulation_mode)
-    bits_per_symbol = 2 * int(mod_params["bits_per_dim"])
-    upsampleno = cfg.UPSAMPLENO
+    bits_per_symbol = (
+        int(mod_params.get("bits_i", mod_params["bits_per_dim"])) +
+        int(mod_params.get("bits_q", mod_params["bits_per_dim"]))
+    )
+    upsampleno = int(upsampleno)
     bandwidth_mhz = awg_sample_rate_ms / upsampleno
     data_rate_mbps = bandwidth_mhz * bits_per_symbol
     log(f"带宽: {bandwidth_mhz:.1f} MHz "
@@ -94,7 +98,7 @@ def run_experiment(datano: int = cfg.DATANO,
                 f"接收文件 {Path(rx_file).name} 是多列数据，看起来是均衡后的符号文件 "
                 f"(eq_*.txt)。离线处理需要选择原始接收波形文件 (rx_*.txt)。"
             )
-        expected_len = datano * cfg.UPSAMPLENO
+        expected_len = datano * upsampleno
         if len(rx_raw) < expected_len:
             raise ValueError(
                 f"接收文件 {Path(rx_file).name} 长度 {len(rx_raw)} 远小于期望的原始波形长度 "
@@ -129,7 +133,7 @@ def run_experiment(datano: int = cfg.DATANO,
 
     # ---- 下变频 + 匹配滤波 + 抽取 ----
     data_recover = core.downconvert_to_symbols(
-        datarx, tx["cos1"], tx["sin1"], tx["filter_cos"], cfg.UPSAMPLENO, 0)
+        datarx, tx["cos1"], tx["sin1"], tx["filter_cos"], upsampleno, 0)
     datarx1 = np.real(data_recover)
     datarx2 = np.imag(data_recover)
 
@@ -163,8 +167,8 @@ def run_experiment(datano: int = cfg.DATANO,
     _, ber_band2 = core.biterr(rx_dec2[sl], decimal2[sl])
     ber_avg = float(np.mean([ber_band1, ber_band2]))
 
-    if modulation_mode == core.MODULATION_SUPERPOSED:
-        # 叠加模式保留 PAM6 / PAM4 双层指标
+    if modulation_mode == core.MODULATION_36QAM:
+        # 36QAM 保留 PAM6 / PAM4 双层指标
         params = core.get_modulation_params(modulation_mode)
         dec6_1 = core.pam_demodulate(np.real(recoverdata), params["levels"])
         dec6_2 = core.pam_demodulate(np.imag(recoverdata), params["levels"])
@@ -189,7 +193,7 @@ def run_experiment(datano: int = cfg.DATANO,
 
     return {
         "run_id": run_id,
-        "mode": "superposed",
+        "mode": "36QAM",
         "modulation_mode": modulation_mode,
         "data_source": data_source,
         "datano": datano,
@@ -239,6 +243,8 @@ def main():
                         help="示波器采样率（MSa/s）")
     parser.add_argument("--awg-sample-rate", type=float, default=cfg.AWG_SAMPLE,
                         help="AWG 采样率（MSa/s），也用于重采样")
+    parser.add_argument("--upsampleno", type=int, default=cfg.UPSAMPLENO,
+                        help="上采样倍数（每个符号的采样点数）")
     parser.add_argument("--snr", type=float, default=cfg.SNR_DB)
     parser.add_argument("--seed", type=int, default=cfg.SEED_BAND1)
     parser.add_argument("--datano", type=int, default=cfg.DATANO)
@@ -248,7 +254,7 @@ def main():
     parser.add_argument("--numof-ts", type=int, default=cfg.NUMOF_TS)
     parser.add_argument("--modulation", choices=core.SUPPORTED_MODULATIONS,
                         default=cfg.MODULATION_MODE,
-                        help="调制模式: superposed/4QAM/16QAM/64QAM/36QAM_NLTCP")
+                        help="调制模式: 36QAM/4QAM/16QAM/32QAM/64QAM")
     args = parser.parse_args()
 
     record = run_experiment(
@@ -259,6 +265,7 @@ def main():
         osc_channel=args.osc_channel, osc_dual=args.osc_dual,
         osc_sample_rate_ms=args.osc_sample_rate,
         awg_sample_rate_ms=args.awg_sample_rate,
+        upsampleno=args.upsampleno,
         modulation_mode=args.modulation)
     save_record(record["run_id"], record, cfg.RECORD_DIR)
 
