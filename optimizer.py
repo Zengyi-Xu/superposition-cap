@@ -307,6 +307,7 @@ def run_lms_coordinate_search(
     snr_db: float = cfg.SNR_DB,
     modulation_mode: str = cfg.MODULATION_MODE,
     numof_ts: int = cfg.NUMOF_TS,
+    awg_sample_rate_ms: Optional[float] = None,
     taps_range: Tuple[int, int, int] = (3, 31, 4),
     mu1_range: Tuple[float, float, int] = (1e-4, 1e-1, 5),
     mu2_range: Tuple[float, float, int] = (1e-4, 1e-1, 5),

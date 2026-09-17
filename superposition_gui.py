@@ -1720,6 +1720,7 @@ class RunPanel(ttk.Frame):
                 snr_db=self.snr_var.get(),
                 modulation_mode=self.mod_var.get(),
                 numof_ts=self.ts_var.get(),
+                awg_sample_rate_ms=self.awgsrate_var.get(),
                 taps_range=(
                     self.sweep_taps_min_var.get(),
                     self.sweep_taps_max_var.get(),
