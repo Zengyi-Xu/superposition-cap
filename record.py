@@ -46,6 +46,12 @@ def save_record(run_id: str,
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(full_record, f, indent=2, ensure_ascii=False, default=str)
 
+def _fmt_num(v, fmt="{}"):
+    if v is None or v == "" or v == 0:
+        return "N/A"
+    return fmt.format(v)
+
+
     lines = [
         f"运行 ID: {run_id}",
         f"时间戳: {full_record['timestamp']}",
@@ -56,10 +62,10 @@ def save_record(run_id: str,
         f"信噪比: {full_record.get('snr_db', 'N/A')} dB",
         f"LMS 抽头/步长: {full_record.get('lms_taps', 'N/A')} / "
         f"{full_record.get('lms_mu1', 'N/A')}, {full_record.get('lms_mu2', 'N/A')}",
-        f"AWG 采样率: {full_record.get('awg_sample_rate_ms', 'N/A')} MSa/s / "
-        f"上采样: ×{full_record.get('upsampleno', 'N/A')} / "
-        f"带宽: {full_record.get('bandwidth_mhz', 'N/A')} MHz",
-        f"传输速率: {full_record.get('data_rate_mbps', 'N/A')} Mbps",
+        f"AWG 采样率: {_fmt_num(full_record.get('awg_sample_rate_ms'))} MSa/s / "
+        f"上采样: ×{_fmt_num(full_record.get('upsampleno'))} / "
+        f"带宽: {_fmt_num(full_record.get('bandwidth_mhz'))} MHz",
+        f"传输速率: {_fmt_num(full_record.get('data_rate_mbps'))} Mbps",
         f"PAM6 带1 误码率: {full_record.get('ber_pam6_1', 'N/A')}",
         f"PAM6 带2 误码率: {full_record.get('ber_pam6_2', 'N/A')}",
         f"PAM4 带1 误码率: {full_record.get('ber_band1', 'N/A')}",
