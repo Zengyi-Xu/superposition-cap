@@ -21,9 +21,21 @@ for _d in (DATA_DIR, TXDATA_DIR, RXDATA_DIR, PLOT_DIR, RECORD_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
+# 调制模式
+# ---------------------------------------------------------------------------
+# modulation_mode:
+#   "superposed"  = 功率域叠加 PAM4+PAM4 -> 类 16QAM（原默认，两路 PAM4 差分映射为 PAM6）
+#   "4QAM"        = 普通 4QAM（QPSK，每维 PAM2）
+#   "16QAM"       = 普通 16QAM（每维 PAM4）
+#   "64QAM"       = 普通 64QAM（每维 PAM8）
+#   "36QAM_NLTCP" = 36QAM + 概率整形（NLTCP，每维 PAM6，Maxwell-Boltzmann 分布）
+MODULATION_MODE = "superposed"
+NLTCP_SHAPING_FACTOR = 0.15       # 概率整形系数 λ，越大越偏向内圈星座点
+
+# ---------------------------------------------------------------------------
 # 发射机参数（A1_TX_MIMOPAM4toPAM_0723.m）
 # ---------------------------------------------------------------------------
-PAM_ORDER = 4                     # 每路基带 PAM 阶数
+PAM_ORDER = 4                     # 每路基带 PAM 阶数（superposed 模式下使用）
 DATANO = 1024 * 32                # 符号数
 UPSAMPLENO = 3                    # 上采样倍数（每个符号 3 个采样点）
 ROLLOFF = 0.205                   # SRRC 滚降系数
@@ -77,13 +89,12 @@ OSC_SAMPLE_RATE = 2000e6          # :ACQUIRE:SRATE
 OSC_TIMEBASE_SCALE = 60e-6        # :TIMEBASE:SCALE
 
 # ---------------------------------------------------------------------------
-# M8190A 任意波形发生器（Keysight，TCP/IP 5025）
+# Tektronix AWG520 任意波形发生器（GPIB）
 # ---------------------------------------------------------------------------
 AWG_SAMPLE_RATE = AWG_SAMPLE * 1e6  # AWG 采样率（Hz），= 900 MSa/s
 AWG_VPP = 0.5                     # 输出幅度（Vpp）
-AWG_OUTPUT_ROUTE = "DAC"          # 输出路径: DC / AC / DAC
-# VISA 地址（把 localhost 换成 AWG 实际 IP）：
-AWG_VISA_ADDR = "TCPIP0::localhost::5025::SOCKET"
+# VISA 地址（根据 GPIB 卡与仪器地址修改，例如 GPIB0::1::INSTR）：
+AWG_VISA_ADDR = "GPIB0::1::INSTR"
 
 # ---------------------------------------------------------------------------
 # 绘图 / 记录
@@ -91,3 +102,30 @@ AWG_VISA_ADDR = "TCPIP0::localhost::5025::SOCKET"
 PLOT_SHOW = False
 PLOT_SAVE = True
 PLOT_DPI = 300
+
+# ---------------------------------------------------------------------------
+# Keithley 2400 源表（两台，分别用于 I/Q 两路偏置或独立实验）
+# ---------------------------------------------------------------------------
+SMU_BAUDRATE = 9600
+SMU_TIMEOUT = 5.0
+
+SMU1_ADDR = "COM3"
+SMU1_INTERFACE = "rs232"        # "rs232" 或 "gpib"
+SMU1_SOURCE_MODE = "voltage"    # "voltage" / "current"
+SMU1_LEVEL = 1.0                # V 或 A，取决于源模式
+SMU1_COMPLIANCE = 0.1           # A 或 V，取决于源模式
+SMU1_NPLC = 1.0
+
+SMU2_ADDR = "COM4"
+SMU2_INTERFACE = "rs232"
+SMU2_SOURCE_MODE = "voltage"
+SMU2_LEVEL = 1.0
+SMU2_COMPLIANCE = 0.1
+SMU2_NPLC = 1.0
+
+SMU3_ADDR = "COM5"
+SMU3_INTERFACE = "rs232"
+SMU3_SOURCE_MODE = "voltage"
+SMU3_LEVEL = 1.0
+SMU3_COMPLIANCE = 0.1
+SMU3_NPLC = 1.0

@@ -49,6 +49,7 @@ def save_record(run_id: str,
     lines = [
         f"运行 ID: {run_id}",
         f"时间戳: {full_record['timestamp']}",
+        f"调制模式: {full_record.get('modulation_mode', 'superposed')}",
         f"数据源: {full_record.get('data_source', 'N/A')}",
         f"符号数: {full_record.get('datano', 'N/A')}",
         f"随机种子: {full_record.get('seed', 'N/A')}",

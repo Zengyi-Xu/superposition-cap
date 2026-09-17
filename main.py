@@ -32,16 +32,19 @@ def run_experiment(datano: int = cfg.DATANO,
                    data_source: str = cfg.DATA_SOURCE,
                    rx_file: str = "",
                    osc_addr: str = cfg.OSC_VISA_ADDR,
+                   modulation_mode: str = cfg.MODULATION_MODE,
                    run_id: str = None,
                    log=print) -> dict:
     """运行一次完整收发实验，返回记录字典（调用方负责 save_record）。"""
+    if modulation_mode not in core.SUPPORTED_MODULATIONS:
+        raise ValueError(f"不支持的调制模式: {modulation_mode!r}")
     run_id = run_id or generate_run_id()
-    log(f"[{run_id}] 数据源: {data_source}  符号数: {datano}  种子: {seed}")
+    log(f"[{run_id}] 调制模式: {modulation_mode}  数据源: {data_source} "
+        f" 符号数: {datano}  种子: {seed}")
 
     # ---- 发射（TX）----
-    decimal1, decimal2 = core.generate_pam4_streams(datano, seed, seed + 100)
-    v1 = core.pam4_to_pam6(decimal1)
-    v2 = core.pam4_to_pam6(decimal2)
+    v1, v2, decimal1, decimal2 = core.generate_symbols(
+        modulation_mode, datano, seed, seed + 100)
     tx = core.generate_tx(v1, v2)
 
     tx1_path = cfg.TXDATA_DIR / f"txI_{run_id}.txt"
@@ -49,8 +52,8 @@ def run_experiment(datano: int = cfg.DATANO,
     txsum_path = cfg.TXDATA_DIR / f"txsum_{run_id}.txt"
     v1_path = cfg.TXDATA_DIR / f"v1_{run_id}.txt"
     v2_path = cfg.TXDATA_DIR / f"v2_{run_id}.txt"
-    dec1_path = cfg.TXDATA_DIR / f"decimal_PAM4_1_{run_id}.txt"
-    dec2_path = cfg.TXDATA_DIR / f"decimal_PAM4_2_{run_id}.txt"
+    dec1_path = cfg.TXDATA_DIR / f"txsym_1_{run_id}.txt"
+    dec2_path = cfg.TXDATA_DIR / f"txsym_2_{run_id}.txt"
     save_txt(tx1_path, tx["data1"])
     save_txt(tx2_path, tx["data2"])
     save_txt(txsum_path, tx["tx_sum"])
@@ -104,24 +107,29 @@ def run_experiment(datano: int = cfg.DATANO,
     log(f"MIMO LMS 完成: taps={lms_taps}, mu=({lms_mu1}, {lms_mu2}), 训练 {numof_ts} 符号")
 
     # ---- 判决与解码 ----
-    rx1_scaled = np.real(recoverdata) / 2.0 + 2.5
-    rx2_scaled = np.imag(recoverdata) / 2.0 + 2.5
-    dec_pam6_1 = core.pam6_demodulate(rx1_scaled)
-    dec_pam6_2 = core.pam6_demodulate(rx2_scaled)
-    dec_pam4_1 = core.pam6_to_pam4(dec_pam6_1)
-    dec_pam4_2 = core.pam6_to_pam4(dec_pam6_2)
-
-    v1_unscaled = v1 / 2.0 + 2.5
-    v2_unscaled = v2 / 2.0 + 2.5
+    rx_dec1, rx_dec2 = core.demodulate_symbols(recoverdata, modulation_mode)
     sl = slice(lms_taps - 1, datano - lms_taps)
 
-    _, ber_pam6_1 = core.biterr(dec_pam6_1[sl], v1_unscaled[sl])
-    _, ber_pam6_2 = core.biterr(dec_pam6_2[sl], v2_unscaled[sl])
-    _, ber_band1 = core.biterr(dec_pam4_1[sl], decimal1[sl])
-    _, ber_band2 = core.biterr(dec_pam4_2[sl], decimal2[sl])
+    _, ber_band1 = core.biterr(rx_dec1[sl], decimal1[sl])
+    _, ber_band2 = core.biterr(rx_dec2[sl], decimal2[sl])
     ber_avg = float(np.mean([ber_band1, ber_band2]))
-    log(f"PAM6 层 BER: 带1={ber_pam6_1:.4e}, 带2={ber_pam6_2:.4e}")
-    log(f"PAM4 层 BER: 带1={ber_band1:.4e}, 带2={ber_band2:.4e}")
+
+    if modulation_mode == core.MODULATION_SUPERPOSED:
+        # 叠加模式保留 PAM6 / PAM4 双层指标
+        params = core.get_modulation_params(modulation_mode)
+        dec6_1 = core.pam_demodulate(np.real(recoverdata), params["levels"])
+        dec6_2 = core.pam_demodulate(np.imag(recoverdata), params["levels"])
+        v1_unscaled = v1 / 2.0 + 2.5
+        v2_unscaled = v2 / 2.0 + 2.5
+        _, ber_pam6_1 = core.biterr(dec6_1[sl], v1_unscaled[sl])
+        _, ber_pam6_2 = core.biterr(dec6_2[sl], v2_unscaled[sl])
+        log(f"PAM6 层 BER: 带1={ber_pam6_1:.4e}, 带2={ber_pam6_2:.4e}")
+        log(f"PAM4 层 BER: 带1={ber_band1:.4e}, 带2={ber_band2:.4e}")
+    else:
+        # 普通 QAM / NLTCP-QAM 只有一层判决
+        ber_pam6_1 = ber_band1
+        ber_pam6_2 = ber_band2
+        log(f"I/Q 支路 BER: 带1={ber_band1:.4e}, 带2={ber_band2:.4e}")
     log(f"平均 BER = {ber_avg:.4e}")
 
     # ---- 保存接收/均衡结果 ----
@@ -133,6 +141,7 @@ def run_experiment(datano: int = cfg.DATANO,
     return {
         "run_id": run_id,
         "mode": "superposed",
+        "modulation_mode": modulation_mode,
         "data_source": data_source,
         "datano": datano,
         "seed": seed,
@@ -152,6 +161,9 @@ def run_experiment(datano: int = cfg.DATANO,
         "txsum_path": str(txsum_path),
         "v1_path": str(v1_path),
         "v2_path": str(v2_path),
+        "txsym1_path": str(dec1_path),
+        "txsym2_path": str(dec2_path),
+        # 保留旧字段名，兼容旧记录 / 旧 GUI 引用
         "dec1_path": str(dec1_path),
         "dec2_path": str(dec2_path),
         "rx_path": str(rx_path),
@@ -173,13 +185,17 @@ def main():
     parser.add_argument("--lms-mu1", type=float, default=cfg.LMS_MU1)
     parser.add_argument("--lms-mu2", type=float, default=cfg.LMS_MU2)
     parser.add_argument("--numof-ts", type=int, default=cfg.NUMOF_TS)
+    parser.add_argument("--modulation", choices=core.SUPPORTED_MODULATIONS,
+                        default=cfg.MODULATION_MODE,
+                        help="调制模式: superposed/4QAM/16QAM/64QAM/36QAM_NLTCP")
     args = parser.parse_args()
 
     record = run_experiment(
         datano=args.datano, seed=args.seed, snr_db=args.snr,
         lms_taps=args.lms_taps, lms_mu1=args.lms_mu1, lms_mu2=args.lms_mu2,
         numof_ts=args.numof_ts, data_source=args.data_source,
-        rx_file=args.rx_file, osc_addr=args.osc_addr)
+        rx_file=args.rx_file, osc_addr=args.osc_addr,
+        modulation_mode=args.modulation)
     save_record(record["run_id"], record, cfg.RECORD_DIR)
 
 

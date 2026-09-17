@@ -135,6 +135,17 @@ def _fn_pam4_source(inputs, params, ctx):
     return {"dec1": dec1, "dec2": dec2}
 
 
+def _fn_symbol_source(inputs, params, ctx):
+    """通用符号序列源：支持 superposed/4QAM/16QAM/64QAM/36QAM_NLTCP。"""
+    datano = int(params.get("datano", config.DATANO))
+    seed = int(params.get("seed", config.SEED_BAND1))
+    mode = str(params.get("modulation", config.MODULATION_MODE))
+    lambda_ = float(params.get("shaping_lambda", config.NLTCP_SHAPING_FACTOR))
+    v1, v2, dec1, dec2 = core.generate_symbols(mode, datano, seed, seed + 100, lambda_)
+    ctx.log(f"符号序列 ({mode}): 2 路 x {datano} 符号, seed={seed}/{seed + 100}")
+    return {"dec1": dec1, "dec2": dec2, "v1": v1, "v2": v2}
+
+
 def _fn_load_var(inputs, params, ctx):
     """从文件读取变量（txt / npy）。"""
     path = Path(str(params.get("path", "")))
@@ -220,7 +231,7 @@ def _fn_virtual_channel(inputs, params, ctx):
 # 硬件
 # ======================================================================
 def _fn_awg_download_dual(inputs, params, ctx):
-    """把两路波形分别下载到 M8190A 的 CH1 / CH2 并同步播放（需硬件）。"""
+    """把两路波形分别下载到 AWG520 的 CH1 / CH2 并同步播放（需硬件）。"""
     import awg_m8190a
     w1 = np.asarray(inputs["wave1"]).ravel()
     w2 = np.asarray(inputs["wave2"]).ravel()
@@ -228,10 +239,9 @@ def _fn_awg_download_dual(inputs, params, ctx):
         w1, w2,
         vpp=float(params.get("vpp", config.AWG_VPP)),
         visa_addr=str(params.get("visa_addr", config.AWG_VISA_ADDR)),
-        output_route=str(params.get("route", config.AWG_OUTPUT_ROUTE)),
         log=ctx.log,
     )
-    ctx.log(f"AWG 双通道下载完成: {len(w1)}/{len(w2)} 点")
+    ctx.log(f"AWG520 双通道下载完成: {len(w1)}/{len(w2)} 点")
     return {}
 
 
@@ -314,6 +324,15 @@ def _fn_pam6_decide(inputs, params, ctx):
     return {"dec1": dec1, "dec2": dec2}
 
 
+def _fn_symbol_decide(inputs, params, ctx):
+    """通用判决：按调制模式对恢复符号流进行判决（superposed 会差分解码回 PAM4）。"""
+    recover = np.asarray(inputs["recover"])
+    mode = str(params.get("modulation", config.MODULATION_MODE))
+    dec1, dec2 = core.demodulate_symbols(recover, mode)
+    ctx.log(f"{mode} 判决: {len(dec1)} + {len(dec2)} 符号")
+    return {"dec1": dec1, "dec2": dec2}
+
+
 def _fn_pam4_decode(inputs, params, ctx):
     """PAM6 差分解码回 PAM4（0..3）。"""
     d1 = core.pam6_to_pam4(np.asarray(inputs["dec6_1"]).ravel().astype(int))
@@ -333,32 +352,40 @@ def _fn_ber(inputs, params, ctx):
 
 
 def _fn_ber_report(inputs, params, ctx):
-    """一次性统计两路 PAM6 / PAM4 层 BER（跳过 LMS 抽头边缘，与 main.py 一致）。"""
+    """一次性统计两路 BER（跳过 LMS 抽头边缘，与 main.py 一致）。
+
+    superposed 模式下输出 PAM6/PAM4 双层指标；其它模式输出单层 I/Q 支路指标。
+    """
     recover = np.asarray(inputs["recover"])
     decimal1 = np.asarray(inputs["dec1_tx"]).ravel().astype(int)
     decimal2 = np.asarray(inputs["dec2_tx"]).ravel().astype(int)
     v1 = np.asarray(inputs["v1"]).ravel()
     v2 = np.asarray(inputs["v2"]).ravel()
     taps = int(params.get("taps", config.LMS_TAPS))
+    mode = str(params.get("modulation", config.MODULATION_MODE))
     datano = len(decimal1)
 
-    dec6_1 = core.pam6_demodulate(np.real(recover) / 2.0 + 2.5)
-    dec6_2 = core.pam6_demodulate(np.imag(recover) / 2.0 + 2.5)
-    dec4_1 = core.pam6_to_pam4(dec6_1).astype(int)
-    dec4_2 = core.pam6_to_pam4(dec6_2).astype(int)
-
+    rx_dec1, rx_dec2 = core.demodulate_symbols(recover, mode)
     sl = slice(taps - 1, datano - taps)
-    _, ber6_1 = core.biterr(dec6_1[sl], (v1 / 2.0 + 2.5)[sl])
-    _, ber6_2 = core.biterr(dec6_2[sl], (v2 / 2.0 + 2.5)[sl])
-    _, ber1 = core.biterr(dec4_1[sl], decimal1[sl])
-    _, ber2 = core.biterr(dec4_2[sl], decimal2[sl])
-    avg = float(np.mean([ber1, ber2]))
-    ctx.log(f"PAM6 层 BER: 带1={ber6_1:.4e}, 带2={ber6_2:.4e}")
-    ctx.log(f"PAM4 层 BER: 带1={ber1:.4e}, 带2={ber2:.4e}")
-    ctx.log(f"平均 BER = {avg:.4e}")
+    _, ber1 = core.biterr(rx_dec1[sl], decimal1[sl])
+    _, ber2 = core.biterr(rx_dec2[sl], decimal2[sl])
+    ber_avg = float(np.mean([ber1, ber2]))
+
+    if mode == core.MODULATION_SUPERPOSED:
+        params6 = core.get_modulation_params(mode)
+        dec6_1 = core.pam_demodulate(np.real(recover), params6["levels"])
+        dec6_2 = core.pam_demodulate(np.imag(recover), params6["levels"])
+        _, ber6_1 = core.biterr(dec6_1[sl], (v1 / 2.0 + 2.5)[sl])
+        _, ber6_2 = core.biterr(dec6_2[sl], (v2 / 2.0 + 2.5)[sl])
+        ctx.log(f"PAM6 层 BER: 带1={ber6_1:.4e}, 带2={ber6_2:.4e}")
+        ctx.log(f"PAM4 层 BER: 带1={ber1:.4e}, 带2={ber2:.4e}")
+    else:
+        ber6_1, ber6_2 = ber1, ber2
+        ctx.log(f"I/Q 支路 BER: 带1={ber1:.4e}, 带2={ber2:.4e}")
+    ctx.log(f"平均 BER = {ber_avg:.4e}")
     return {"ber_pam6_1": float(ber6_1), "ber_pam6_2": float(ber6_2),
             "ber_band1": float(ber1), "ber_band2": float(ber2),
-            "ber_avg": avg}
+            "ber_avg": ber_avg}
 
 
 # ======================================================================
@@ -378,6 +405,7 @@ def _fn_full_experiment(inputs, params, ctx):
         data_source=str(params.get("data_source", "virtual")),
         rx_file=str(params.get("rx_file", "")),
         osc_addr=str(params.get("osc_addr", config.OSC_VISA_ADDR)),
+        modulation_mode=str(params.get("modulation_mode", config.MODULATION_MODE)),
         log=ctx.log,
     )
     return {"record": record, "ber_avg": record["ber_avg"]}
@@ -514,6 +542,20 @@ def _register_all():
         _fn_pam4_source))
 
     register(NodeDef(
+        "symbol_source", "通用符号源", "数据源",
+        "生成 superposed/4QAM/16QAM/64QAM/36QAM_NLTCP 的 I/Q 符号（同时输出索引与电平）",
+        [], [PortDef("dec1", "I 索引", "pam"),
+             PortDef("dec2", "Q 索引", "pam"),
+             PortDef("v1", "I 电平", "pam"),
+             PortDef("v2", "Q 电平", "pam")],
+        [ParamDef("datano", "符号数", "int", config.DATANO),
+         ParamDef("seed", "种子", "int", config.SEED_BAND1),
+         ParamDef("modulation", "调制模式", "choice", config.MODULATION_MODE,
+                  core.SUPPORTED_MODULATIONS),
+         ParamDef("shaping_lambda", "整形系数 λ", "float", config.NLTCP_SHAPING_FACTOR)],
+        _fn_symbol_source))
+
+    register(NodeDef(
         "load_rx_file", "读取接收文件", "数据源",
         "读取接收波形 txt；路径留空取 rxdata 下最新的 rx_*.txt",
         [], [PortDef("waveform", "波形", "waveform")],
@@ -569,14 +611,12 @@ def _register_all():
     # ---- 硬件 ----
     register(NodeDef(
         "awg_download_dual", "AWG 双通道下载", "硬件",
-        "两路波形分别下载到 M8190A CH1 / CH2 并同步播放",
+        "两路波形分别下载到 AWG520 CH1 / CH2 并同步播放",
         [PortDef("wave1", "CH1 波形", "waveform"),
          PortDef("wave2", "CH2 波形", "waveform")],
         [],
         [ParamDef("visa_addr", "VISA 地址", "str", config.AWG_VISA_ADDR),
-         ParamDef("vpp", "幅度 Vpp", "float", config.AWG_VPP),
-         ParamDef("route", "输出路径", "choice", config.AWG_OUTPUT_ROUTE,
-                  ["DAC", "DC", "AC"])],
+         ParamDef("vpp", "幅度 Vpp", "float", config.AWG_VPP)],
         _fn_awg_download_dual))
 
     register(NodeDef(
@@ -632,6 +672,15 @@ def _register_all():
         [], _fn_pam6_decide))
 
     register(NodeDef(
+        "symbol_decide", "通用判决", "解调",
+        "按调制模式对恢复符号流判决（superposed 会解码回 PAM4）",
+        [PortDef("recover", "恢复符号流", "symbols")],
+        [PortDef("dec1", "判决-1", "pam"), PortDef("dec2", "判决-2", "pam")],
+        [ParamDef("modulation", "调制模式", "choice", config.MODULATION_MODE,
+                  core.SUPPORTED_MODULATIONS)],
+        _fn_symbol_decide))
+
+    register(NodeDef(
         "pam4_decode", "PAM4 解码", "解调",
         "PAM6 差分解码回 PAM4（0..3）",
         [PortDef("dec6_1", "PAM6-1", "pam6"), PortDef("dec6_2", "PAM6-2", "pam6")],
@@ -650,18 +699,20 @@ def _register_all():
 
     register(NodeDef(
         "ber_report", "BER 汇总报告", "解调",
-        "两路 PAM6 / PAM4 层 BER 汇总（跳过 LMS 抽头边缘，与 main.py 一致）",
+        "两路 BER 汇总（跳过 LMS 抽头边缘，与 main.py 一致）",
         [PortDef("recover", "恢复符号流", "symbols"),
-         PortDef("dec1_tx", "PAM4-1 发送", "pam4"),
-         PortDef("dec2_tx", "PAM4-2 发送", "pam4"),
-         PortDef("v1", "PAM6-1 参考", "pam6"),
-         PortDef("v2", "PAM6-2 参考", "pam6")],
+         PortDef("dec1_tx", "发送-1", "pam"),
+         PortDef("dec2_tx", "发送-2", "pam"),
+         PortDef("v1", "I 电平参考", "pam"),
+         PortDef("v2", "Q 电平参考", "pam")],
         [PortDef("ber_avg", "平均 BER", "scalar"),
          PortDef("ber_band1", "带1 BER", "scalar", False),
          PortDef("ber_band2", "带2 BER", "scalar", False),
          PortDef("ber_pam6_1", "PAM6-1 BER", "scalar", False),
          PortDef("ber_pam6_2", "PAM6-2 BER", "scalar", False)],
-        [ParamDef("taps", "LMS 抽头数", "int", config.LMS_TAPS)],
+        [ParamDef("taps", "LMS 抽头数", "int", config.LMS_TAPS),
+         ParamDef("modulation", "调制模式", "choice", config.MODULATION_MODE,
+                  core.SUPPORTED_MODULATIONS)],
         _fn_ber_report))
 
     # ---- 分析 ----
@@ -680,6 +731,8 @@ def _register_all():
          ParamDef("lms_mu1", "LMS μ1", "float", config.LMS_MU1),
          ParamDef("lms_mu2", "LMS μ2", "float", config.LMS_MU2),
          ParamDef("numof_ts", "训练符号数", "int", config.NUMOF_TS),
+         ParamDef("modulation_mode", "调制模式", "choice", config.MODULATION_MODE,
+                  core.SUPPORTED_MODULATIONS),
          ParamDef("rx_file", "接收文件", "str", ""),
          ParamDef("osc_addr", "示波器地址", "str", config.OSC_VISA_ADDR)],
         _fn_full_experiment))

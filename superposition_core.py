@@ -46,6 +46,174 @@ def pam4_to_pam6(decimal_pam4: np.ndarray) -> np.ndarray:
     return (v - 2.5) * 2.0
 
 
+# -----------------------------------------------------------------------------
+# 调制模式支持（普通 QAM / NLTCP-QAM / 叠加 PAM）
+# -----------------------------------------------------------------------------
+MODULATION_SUPERPOSED = "superposed"
+MODULATION_QAM4 = "4QAM"
+MODULATION_QAM16 = "16QAM"
+MODULATION_QAM64 = "64QAM"
+MODULATION_NLTCP36 = "36QAM_NLTCP"
+SUPPORTED_MODULATIONS = [
+    MODULATION_SUPERPOSED, MODULATION_QAM4,
+    MODULATION_QAM16, MODULATION_QAM64, MODULATION_NLTCP36,
+]
+
+
+def _pam_levels(order: int) -> np.ndarray:
+    """返回对称奇数 PAM 电平：order=2 -> [-1,1]；order=4 -> [-3,-1,1,3]；以此类推。"""
+    return np.arange(order, dtype=float) * 2.0 - (order - 1.0)
+
+
+def get_modulation_params(mode: str) -> dict:
+    """返回指定调制模式的参数字典。"""
+    if mode == MODULATION_SUPERPOSED:
+        return {
+            "mode": mode,
+            "is_superposed": True,
+            "order_per_dim": 6,
+            "levels": _pam_levels(6),
+            "bits_per_dim": 2,
+            "shaped": False,
+        }
+    if mode == MODULATION_QAM4:
+        return {
+            "mode": mode, "is_superposed": False,
+            "order_per_dim": 2, "levels": _pam_levels(2),
+            "bits_per_dim": 1, "shaped": False,
+        }
+    if mode == MODULATION_QAM16:
+        return {
+            "mode": mode, "is_superposed": False,
+            "order_per_dim": 4, "levels": _pam_levels(4),
+            "bits_per_dim": 2, "shaped": False,
+        }
+    if mode == MODULATION_QAM64:
+        return {
+            "mode": mode, "is_superposed": False,
+            "order_per_dim": 8, "levels": _pam_levels(8),
+            "bits_per_dim": 3, "shaped": False,
+        }
+    if mode == MODULATION_NLTCP36:
+        return {
+            "mode": mode, "is_superposed": False,
+            "order_per_dim": 6, "levels": _pam_levels(6),
+            "bits_per_dim": 3, "shaped": True,
+        }
+    raise ValueError(f"不支持的调制模式: {mode!r}，可选: {SUPPORTED_MODULATIONS}")
+
+
+def generate_pam_streams_uniform(datano: int,
+                                 order: int,
+                                 seed1: int = config.SEED_BAND1,
+                                 seed2: int = config.SEED_BAND2
+                                 ) -> Tuple[np.ndarray, np.ndarray]:
+    """生成两路 [0, order) 的均匀随机 PAM 十进制索引序列。"""
+    np.random.seed(seed1)
+    d1 = np.random.randint(0, order, size=datano)
+    np.random.seed(seed2)
+    d2 = np.random.randint(0, order, size=datano)
+    return d1, d2
+
+
+def _mb_probs(levels: np.ndarray, lambda_: float) -> np.ndarray:
+    """Maxwell-Boltzmann 概率分布：P(x) ∝ exp(-λ·x²)。"""
+    levels = np.asarray(levels, dtype=float)
+    probs = np.exp(-lambda_ * levels ** 2)
+    return probs / np.sum(probs)
+
+
+def generate_pam_streams_shaped(datano: int,
+                                order: int,
+                                seed1: int = config.SEED_BAND1,
+                                seed2: int = config.SEED_BAND2,
+                                lambda_: float = config.NLTCP_SHAPING_FACTOR
+                                ) -> Tuple[np.ndarray, np.ndarray]:
+    """生成两路概率整形 PAM 十进制索引序列（内圈点概率更高）。"""
+    probs = _mb_probs(_pam_levels(order), lambda_)
+    np.random.seed(seed1)
+    d1 = np.random.choice(order, size=datano, p=probs)
+    np.random.seed(seed2)
+    d2 = np.random.choice(order, size=datano, p=probs)
+    return d1, d2
+
+
+def pam_indices_to_levels(indices: np.ndarray, order: int) -> np.ndarray:
+    """把 PAM 十进制索引映射为实际电平值。"""
+    return _pam_levels(order)[np.asarray(indices, dtype=int)]
+
+
+def generate_symbols(mode: str,
+                     datano: int,
+                     seed1: int = config.SEED_BAND1,
+                     seed2: int = config.SEED_BAND2,
+                     shaping_lambda: float = config.NLTCP_SHAPING_FACTOR
+                     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """按指定调制模式生成发射符号。
+
+    Returns
+    -------
+    v1, v2 : np.ndarray
+        I/Q 两路实际电平值（直接输入 generate_tx）。
+    tx_dec1, tx_dec2 : np.ndarray
+        用于 BER 比对的十进制索引：superposed 模式下为 PAM4 索引，
+        其它模式下为每维 PAM 索引（0..order_per_dim-1）。
+    """
+    if mode == MODULATION_SUPERPOSED:
+        decimal1, decimal2 = generate_pam4_streams(datano, seed1, seed2)
+        v1 = pam4_to_pam6(decimal1)
+        v2 = pam4_to_pam6(decimal2)
+        return v1, v2, decimal1, decimal2
+
+    params = get_modulation_params(mode)
+    order = int(params["order_per_dim"])
+    if params["shaped"]:
+        decimal1, decimal2 = generate_pam_streams_shaped(
+            datano, order, seed1, seed2, shaping_lambda)
+    else:
+        decimal1, decimal2 = generate_pam_streams_uniform(
+            datano, order, seed1, seed2)
+    v1 = pam_indices_to_levels(decimal1, order)
+    v2 = pam_indices_to_levels(decimal2, order)
+    return v1, v2, decimal1, decimal2
+
+
+def pam_demodulate(rxdata: np.ndarray, order_or_levels) -> np.ndarray:
+    """PAM 最近邻判决，返回索引 0..order-1。
+
+    Parameters
+    ----------
+    order_or_levels : int 或 array-like
+        整数时表示 PAM 阶数；数组时直接使用给定电平集合。
+    """
+    x = np.asarray(rxdata, dtype=float).ravel()
+    if isinstance(order_or_levels, int):
+        cons = _pam_levels(order_or_levels)
+    else:
+        cons = np.asarray(order_or_levels, dtype=float)
+    idx = np.argmin(np.abs(x[:, None] - cons[None, :]), axis=1)
+    return idx
+
+
+def demodulate_symbols(recoverdata: np.ndarray,
+                       mode: str = MODULATION_SUPERPOSED
+                       ) -> Tuple[np.ndarray, np.ndarray]:
+    """按调制模式对接收回的复数符号流进行判决。
+
+    Returns
+    -------
+    rx_dec1, rx_dec2 : 用于 BER 比对的十进制索引。
+    """
+    rx1 = np.real(np.asarray(recoverdata))
+    rx2 = np.imag(np.asarray(recoverdata))
+    params = get_modulation_params(mode)
+    dec1 = pam_demodulate(rx1, params["levels"])
+    dec2 = pam_demodulate(rx2, params["levels"])
+    if mode == MODULATION_SUPERPOSED:
+        return pam6_to_pam4(dec1), pam6_to_pam4(dec2)
+    return dec1, dec2
+
+
 def srrc_filter(rolloff: float, span: int, sps: int) -> np.ndarray:
     """平方根升余弦（SRRC）滤波器，等价于 MATLAB rcosdesign(rolloff, span, sps, 'sqrt')。"""
     n_taps = span * sps + 1

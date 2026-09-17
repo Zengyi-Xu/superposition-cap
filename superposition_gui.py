@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """Superposed 16QAM Communication System Experiment Platform GUI.
 
-Five tabs:
+Six tabs:
     1. Waveform & Spectrum    —— TX/RX time-domain waveforms and spectra
     2. Superposition Modulation —— superposed constellation and density plots
     3. Transmission Results   —— experiment record table and run-history trend
     4. Run Test               —— run the transceiver from the GUI with live log output
     5. Oscilloscope           —— TCP/IP control of the Keysight oscilloscope
+    6. Source Meters          —— dual Keithley 2400 bias/control (SMU1 / SMU2)
 
 Data sources:
     data/records/record_<run_id>.json          parameters and results for each run
@@ -39,8 +40,10 @@ import config as cfg
 import main as main_flow
 import superposition_core as core
 import awg_m8190a
+import instrument_discovery as instr_disc
 from record import generate_run_id, save_record
 from oscilloscope import KeysightScope, ScopeError
+from source_meter_panel import DualKeithley2400Panel
 
 try:
     import openpyxl
@@ -224,12 +227,12 @@ def _load_run_signals(run_id):
 
 
 def _regen_symbols(rec, max_count=5000):
-    """Regenerate the TX superposed constellation (v1 + 1j*v2) for a record."""
+    """Regenerate the TX constellation (v1 + 1j*v2) for a record."""
     seed = int(rec.get("seed", cfg.SEED_BAND1))
     datano = int(rec.get("datano", cfg.DATANO))
-    dec1, dec2 = core.generate_pam4_streams(min(datano, max_count), seed, seed + 100)
-    v1 = core.pam4_to_pam6(dec1)
-    v2 = core.pam4_to_pam6(dec2)
+    mode = rec.get("modulation_mode", core.MODULATION_SUPERPOSED)
+    v1, v2, _, _ = core.generate_symbols(
+        mode, min(datano, max_count), seed, seed + 100)
     return v1 + 1j * v2
 
 
@@ -335,25 +338,34 @@ def build_tx_constellation(fig, run_id, title):
     if iq is not None and len(iq):
         ax.plot(iq.real, iq.imag, "b.", alpha=0.4, markersize=4)
     ax.set_title(title)
-    ax.set_xlabel("同相 I（带1 PAM6）")
-    ax.set_ylabel("正交 Q（带2 PAM6）")
+    ax.set_xlabel("同相 I")
+    ax.set_ylabel("正交 Q")
     ax.grid(True, alpha=0.3)
     ax.axis("equal")
     fig.tight_layout()
 
 
+def _constellation_axis_limit(mode: str) -> int:
+    """根据调制模式返回星座图坐标轴范围。"""
+    if mode == core.MODULATION_SUPERPOSED:
+        return int(np.log2(cfg.PAM_ORDER)) * 2 + 2  # 6
+    params = core.get_modulation_params(mode)
+    return int(np.max(np.abs(params["levels"]))) + 2
+
+
 def build_rx_constellation(fig, run_id, title):
     rec = _get_record(run_id)
     iq = _load_eq_symbols(rec)
+    mode = rec.get("modulation_mode", core.MODULATION_SUPERPOSED)
     ax = fig.add_subplot(111)
     if iq is not None and len(iq):
         ax.plot(iq.real, iq.imag, "b.", alpha=0.4, markersize=4)
-        maxaxis = int(np.log2(cfg.PAM_ORDER)) * 2 + 2
+        maxaxis = _constellation_axis_limit(mode)
         ax.set_xlim(-maxaxis, maxaxis)
         ax.set_ylim(-maxaxis, maxaxis)
     ax.set_title(title)
-    ax.set_xlabel("同相 I（带1 PAM6）")
-    ax.set_ylabel("正交 Q（带2 PAM6）")
+    ax.set_xlabel("同相 I")
+    ax.set_ylabel("正交 Q")
     ax.grid(True, alpha=0.3)
     ax.axis("equal")
     fig.tight_layout()
@@ -367,8 +379,8 @@ def build_constellation_density(fig, run_id, title):
         hb = ax.hexbin(iq.real, iq.imag, gridsize=80, cmap="GnBu", mincnt=1)
         fig.colorbar(hb, ax=ax, label="密度")
     ax.set_title(title)
-    ax.set_xlabel("同相 I（带1 PAM6）")
-    ax.set_ylabel("正交 Q（带2 PAM6）")
+    ax.set_xlabel("同相 I")
+    ax.set_ylabel("正交 Q")
     ax.axis("equal")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -423,7 +435,7 @@ FIGURES = {
     "tx_spectrum":   (build_tx_spectrum,   "发射频谱"),
     "rx_spectrum":   (build_rx_spectrum,   "接收频谱"),
     # Tab 2: Superposition Modulation
-    "tx_constellation":      (build_tx_constellation,      "发射叠加星座图（PAM6 x PAM6）"),
+    "tx_constellation":      (build_tx_constellation,      "发射星座图"),
     "rx_constellation":      (build_rx_constellation,      "接收星座图（MIMO LMS 均衡后）"),
     "constellation_density": (build_constellation_density, "接收星座密度图"),
 }
@@ -903,6 +915,15 @@ class RunPanel(ttk.Frame):
                    textvariable=self.datano_var, width=16
                    ).grid(row=0, column=3, sticky=tk.W, padx=(4, 16), pady=(10, 4))
 
+        ttk.Label(opt, text="调制模式:", style="Card.TLabel"
+                  ).grid(row=0, column=4, sticky=tk.W, padx=12, pady=(10, 4))
+        self.mod_var = tk.StringVar(value=cfg.MODULATION_MODE)
+        self.mod_combo = ttk.Combobox(
+            opt, textvariable=self.mod_var,
+            values=core.SUPPORTED_MODULATIONS,
+            state="readonly", width=16)
+        self.mod_combo.grid(row=0, column=5, sticky=tk.W, padx=(4, 16), pady=(10, 4))
+
         ttk.Label(opt, text="信噪比 (dB):", style="Card.TLabel"
                   ).grid(row=1, column=0, sticky=tk.W, padx=12, pady=4)
         self.snr_var = tk.DoubleVar(value=cfg.SNR_DB)
@@ -955,10 +976,12 @@ class RunPanel(ttk.Frame):
                   ).grid(row=5, column=0, sticky=tk.W, padx=12, pady=4)
         self.oscaddr_var = tk.StringVar(value=cfg.OSC_VISA_ADDR)
         self.oscaddr_entry = ttk.Entry(opt, textvariable=self.oscaddr_var, width=24)
-        self.oscaddr_entry.grid(row=5, column=1, sticky=tk.W, padx=(4, 16), pady=4)
+        self.oscaddr_entry.grid(row=5, column=1, sticky=tk.W, padx=(4, 4), pady=4)
+        ttk.Button(opt, text="自动识别", command=self._auto_detect_scope
+                   ).grid(row=5, column=2, sticky=tk.W, padx=(0, 16), pady=4)
 
         btn_bar = tk.Frame(opt, bg=COLOR_CARD)
-        btn_bar.grid(row=6, column=0, columnspan=4, sticky=tk.W,
+        btn_bar.grid(row=6, column=0, columnspan=6, sticky=tk.W,
                      padx=12, pady=(4, 8))
         self.run_btn = ttk.Button(btn_bar, text="▶  运行仿真",
                                   style="Accent.TButton",
@@ -971,36 +994,31 @@ class RunPanel(ttk.Frame):
         self.run_status.pack(side=tk.LEFT, padx=16)
 
         # ── AWG card ─────────────────────────────────────────────────
-        awg_card = ttk.LabelFrame(self, text=" M8190A 波形下载（CH1 = I 路，CH2 = Q 路） ")
+        awg_card = ttk.LabelFrame(self, text=" AWG520 波形下载（CH1 = I 路，CH2 = Q 路） ")
         awg_card.pack(fill=tk.X, padx=2, pady=(2, 8))
 
         ttk.Label(awg_card, text="AWG 地址:", style="Card.TLabel"
                   ).grid(row=0, column=0, sticky=tk.W, padx=12, pady=(8, 4))
         self.awgaddr_var = tk.StringVar(value=cfg.AWG_VISA_ADDR)
         ttk.Entry(awg_card, textvariable=self.awgaddr_var, width=36
-                  ).grid(row=0, column=1, sticky=tk.W, padx=(4, 16), pady=(8, 4))
+                  ).grid(row=0, column=1, sticky=tk.W, padx=(4, 4), pady=(8, 4))
+        ttk.Button(awg_card, text="自动识别", command=self._auto_detect_awg
+                   ).grid(row=0, column=2, sticky=tk.W, padx=(0, 16), pady=(8, 4))
 
         ttk.Label(awg_card, text="幅度 Vpp:", style="Card.TLabel"
-                  ).grid(row=0, column=2, sticky=tk.W, padx=12, pady=(8, 4))
+                  ).grid(row=1, column=0, sticky=tk.W, padx=12, pady=(4, 8))
         self.awgvpp_var = tk.DoubleVar(value=cfg.AWG_VPP)
-        tk.Spinbox(awg_card, from_=0.05, to=1.5, increment=0.05,
+        tk.Spinbox(awg_card, from_=0.02, to=2.0, increment=0.05,
                    textvariable=self.awgvpp_var, width=8
-                   ).grid(row=0, column=3, sticky=tk.W, padx=(4, 16), pady=(8, 4))
-
-        ttk.Label(awg_card, text="输出路径:", style="Card.TLabel"
-                  ).grid(row=0, column=4, sticky=tk.W, padx=12, pady=(8, 4))
-        self.awgroute_var = tk.StringVar(value=cfg.AWG_OUTPUT_ROUTE)
-        ttk.Combobox(awg_card, textvariable=self.awgroute_var,
-                     values=["DAC", "DC", "AC"], state="readonly", width=6
-                     ).grid(row=0, column=5, sticky=tk.W, padx=(4, 16), pady=(8, 4))
+                   ).grid(row=1, column=1, sticky=tk.W, padx=(4, 16), pady=(4, 8))
 
         self.awg_dl_btn = ttk.Button(awg_card, text="⬇ 生成并下载双通道波形",
                                      style="Accent.TButton",
                                      command=self._start_awg_download)
-        self.awg_dl_btn.grid(row=0, column=6, sticky=tk.W, padx=(8, 4), pady=(8, 4))
+        self.awg_dl_btn.grid(row=1, column=2, sticky=tk.W, padx=(8, 4), pady=(4, 8))
         self.awg_stop_btn = ttk.Button(awg_card, text="停止输出",
                                        command=self._stop_awg)
-        self.awg_stop_btn.grid(row=0, column=7, sticky=tk.W, padx=(4, 12), pady=(8, 4))
+        self.awg_stop_btn.grid(row=1, column=3, sticky=tk.W, padx=(4, 12), pady=(4, 8))
 
         # ── Bottom: log card ─────────────────────────────────────────
         log_card = ttk.LabelFrame(self, text=" 运行日志 ")
@@ -1042,6 +1060,62 @@ class RunPanel(ttk.Frame):
         if path:
             self.rxfile_var.set(path)
 
+    def _show_instruments_dialog(self, title: str, instruments):
+        """弹出窗口显示识别到的仪器列表。"""
+        text = instr_disc.format_instrument_list(instruments)
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.geometry("700x300")
+        win.transient(self)
+        txt = tk.Text(win, wrap=tk.NONE, font=(FONT_MONO, 9),
+                      bg="#FAFAFA", fg=COLOR_TEXT, bd=0,
+                      highlightbackground=COLOR_BORDER, highlightthickness=1)
+        txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        txt.insert(tk.END, text)
+        txt.configure(state=tk.DISABLED)
+        ttk.Button(win, text="关闭", command=win.destroy
+                   ).pack(side=tk.BOTTOM, pady=(0, 10))
+
+    def _auto_detect_scope(self):
+        """在后台线程自动识别示波器并填入地址。"""
+        self._append_log("正在扫描示波器...")
+        threading.Thread(target=self._auto_detect_scope_thread, daemon=True).start()
+
+    def _auto_detect_scope_thread(self):
+        try:
+            candidates = instr_disc.detect_scope_candidates()
+            if not candidates:
+                self._queue.put(("log", "未识别到示波器，请检查连接与驱动。"))
+                self._queue.put(("info", "未找到示波器。"))
+                return
+            addr = candidates[0]["address"]
+            self._queue.put(("set_oscaddr", addr))
+            self._queue.put(("log", f"已识别示波器: {addr}\n    {candidates[0]['idn']}"))
+            self._queue.put(("show_dialog", ("识别到的示波器", candidates)))
+        except Exception as exc:
+            self._queue.put(("log", f"自动识别失败: {exc}"))
+            self._queue.put(("error", f"自动识别失败: {exc}"))
+
+    def _auto_detect_awg(self):
+        """在后台线程自动识别 AWG 并填入地址。"""
+        self._append_log("正在扫描 AWG...")
+        threading.Thread(target=self._auto_detect_awg_thread, daemon=True).start()
+
+    def _auto_detect_awg_thread(self):
+        try:
+            candidates = instr_disc.detect_awg_candidates()
+            if not candidates:
+                self._queue.put(("log", "未识别到 AWG，请检查连接与驱动。"))
+                self._queue.put(("info", "未找到 AWG。"))
+                return
+            addr = candidates[0]["address"]
+            self._queue.put(("set_awgaddr", addr))
+            self._queue.put(("log", f"已识别 AWG: {addr}\n    {candidates[0]['idn']}"))
+            self._queue.put(("show_dialog", ("识别到的 AWG", candidates)))
+        except Exception as exc:
+            self._queue.put(("log", f"自动识别失败: {exc}"))
+            self._queue.put(("error", f"自动识别失败: {exc}"))
+
     def _start_awg_download(self):
         if self._thread is not None and self._thread.is_alive():
             messagebox.showinfo("忙", "已有任务在运行，请等待完成。")
@@ -1056,18 +1130,16 @@ class RunPanel(ttk.Frame):
         try:
             datano = self.datano_var.get()
             seed = self.seed_var.get()
-            dec1, dec2 = core.generate_pam4_streams(datano, seed, seed + 100)
-            v1 = core.pam4_to_pam6(dec1)
-            v2 = core.pam4_to_pam6(dec2)
+            mode = self.mod_var.get()
+            v1, v2, _, _ = core.generate_symbols(mode, datano, seed, seed + 100)
             tx = core.generate_tx(v1, v2)
             self._queue.put(("log",
-                             f"发射波形已生成: 符号数={datano}, 种子={seed}, "
+                             f"发射波形已生成: 调制={mode}, 符号数={datano}, 种子={seed}, "
                              f"采样率={cfg.AWG_SAMPLE} MSa/s"))
             awg_m8190a.download_two_channels(
                 tx["data1"], tx["data2"],
                 vpp=self.awgvpp_var.get(),
                 visa_addr=self.awgaddr_var.get().strip(),
-                output_route=self.awgroute_var.get(),
                 log=lambda msg: self._queue.put(("log", msg)),
             )
             self._queue.put(("awg_done", None))
@@ -1081,7 +1153,7 @@ class RunPanel(ttk.Frame):
 
         def _do_stop():
             try:
-                with awg_m8190a.M8190AController(
+                with awg_m8190a.AWG520Controller(
                         visa_addr=self.awgaddr_var.get().strip(),
                         log=lambda msg: self._queue.put(("log", msg))) as awg:
                     awg.stop()
@@ -1111,7 +1183,7 @@ class RunPanel(ttk.Frame):
         self.run_btn.configure(state=tk.DISABLED)
         self.run_status.configure(text="运行中…")
         self.app.set_running(True)
-        self._append_log("\n========== Starting Superposed 16QAM Simulation ==========\n", "head")
+        self._append_log("\n========== Starting Simulation ==========\n", "head")
         self._thread = threading.Thread(target=self._run_thread, daemon=True)
         self._thread.start()
         self.after(100, self._poll)
@@ -1130,6 +1202,7 @@ class RunPanel(ttk.Frame):
                 data_source=src,
                 rx_file=self.rxfile_var.get(),
                 osc_addr=self.oscaddr_var.get(),
+                modulation_mode=self.mod_var.get(),
                 log=lambda msg: self._queue.put(("log", msg)),
             )
             save_record(record["run_id"], record, cfg.RECORD_DIR)
@@ -1149,7 +1222,17 @@ class RunPanel(ttk.Frame):
                 elif kind == "error":
                     self._append_log(f"\nError: {payload}\n", "err")
                     traceback.print_exc()
-                    self._on_done(None)
+                    if self._thread is not None and not self._thread.is_alive():
+                        self._on_done(None)
+                elif kind == "info":
+                    messagebox.showinfo("自动识别", payload)
+                elif kind == "set_oscaddr":
+                    self.oscaddr_var.set(payload)
+                elif kind == "set_awgaddr":
+                    self.awgaddr_var.set(payload)
+                elif kind == "show_dialog":
+                    title, instruments = payload
+                    self._show_instruments_dialog(title, instruments)
                 elif kind == "done":
                     self._append_log("\n========== Simulation Completed ==========\n", "head")
                     self._on_done(payload)
@@ -1179,9 +1262,8 @@ class RunPanel(ttk.Frame):
         try:
             datano = min(self.datano_var.get(), 5000)
             seed = self.seed_var.get()
-            dec1, dec2 = core.generate_pam4_streams(datano, seed, seed + 100)
-            v1 = core.pam4_to_pam6(dec1)
-            v2 = core.pam4_to_pam6(dec2)
+            mode = self.mod_var.get()
+            v1, v2, _, _ = core.generate_symbols(mode, datano, seed, seed + 100)
             tx = core.generate_tx(v1, v2)
             data = {"tx": tx["tx_sum"], "sym": v1 + 1j * v2,
                     "fs": cfg.AWG_SAMPLE * 1e6}
@@ -1209,13 +1291,15 @@ class ScopePanel(ttk.Frame):
                   ).grid(row=0, column=0, sticky=tk.W, padx=12, pady=(10, 4))
         self.addr_var = tk.StringVar(value=cfg.OSC_VISA_ADDR)
         ttk.Entry(conn, textvariable=self.addr_var, width=40
-                  ).grid(row=0, column=1, sticky=tk.W, padx=(4, 16), pady=(10, 4))
+                  ).grid(row=0, column=1, sticky=tk.W, padx=(4, 4), pady=(10, 4))
+        ttk.Button(conn, text="自动识别", command=self._auto_detect
+                   ).grid(row=0, column=2, sticky=tk.W, padx=(0, 4), pady=(10, 4))
         self.conn_btn = ttk.Button(conn, text="连接", style="Accent.TButton",
                                    command=self._toggle_connect)
-        self.conn_btn.grid(row=0, column=2, sticky=tk.W, padx=(4, 12), pady=(10, 4))
+        self.conn_btn.grid(row=0, column=3, sticky=tk.W, padx=(4, 12), pady=(10, 4))
         self.idn_var = tk.StringVar(value="未连接")
         ttk.Label(conn, textvariable=self.idn_var, style="DimCard.TLabel"
-                  ).grid(row=0, column=3, sticky=tk.W, padx=8, pady=(10, 4))
+                  ).grid(row=0, column=4, sticky=tk.W, padx=8, pady=(10, 4))
 
         # ── Acquisition card ─────────────────────────────────────────
         acq = ttk.LabelFrame(self, text=" 采集设置 ")
@@ -1274,6 +1358,29 @@ class ScopePanel(ttk.Frame):
             self.log_text.insert(tk.END, text)
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.DISABLED)
+
+    def _auto_detect(self):
+        """在后台线程自动识别示波器并填入地址。"""
+        self._log("正在扫描示波器...")
+
+        def _thread():
+            try:
+                candidates = instr_disc.detect_scope_candidates()
+                if not candidates:
+                    self._queue.put(("log", "未识别到示波器，请检查连接与驱动。"))
+                    self._queue.put(("info", "未找到示波器。"))
+                    return
+                addr = candidates[0]["address"]
+                self._queue.put(("set_addr", addr))
+                self._queue.put(("log", f"已识别: {addr}\n    {candidates[0]['idn']}"))
+                if len(candidates) > 1:
+                    self._queue.put(("show_dialog", candidates))
+            except Exception as exc:
+                self._queue.put(("log", f"自动识别失败: {exc}"))
+                self._queue.put(("error", f"自动识别失败: {exc}"))
+
+        threading.Thread(target=_thread, daemon=True).start()
+        self.after(100, self._poll)
 
     def _toggle_connect(self):
         if self._scope.is_connected:
@@ -1353,6 +1460,21 @@ class ScopePanel(ttk.Frame):
                     self._log(f"\nError: {payload}\n", "err")
                     self.acq_btn.configure(state=tk.NORMAL)
                     return
+                elif kind == "info":
+                    messagebox.showinfo("自动识别", payload)
+                elif kind == "set_addr":
+                    self.addr_var.set(payload)
+                elif kind == "show_dialog":
+                    text = instr_disc.format_instrument_list(payload)
+                    win = tk.Toplevel(self)
+                    win.title("识别到的示波器")
+                    win.geometry("700x250")
+                    win.transient(self)
+                    txt = tk.Text(win, wrap=tk.NONE, font=(FONT_MONO, 9),
+                                  bg="#FAFAFA", fg=COLOR_TEXT)
+                    txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+                    txt.insert(tk.END, text)
+                    txt.configure(state=tk.DISABLED)
                 elif kind == "acq_done":
                     self._log("===== 采集结束 =====\n", "head")
                     self.acq_btn.configure(state=tk.NORMAL)
@@ -1380,7 +1502,7 @@ class SuperpositionGuiApp(tk.Tk):
         self.font_scale = max(dpi / 96.0, 1.0)
         self.tk.call("tk", "scaling", dpi / 72.0)
 
-        self.title(f"{APP_EMOJI} Superposed 16QAM Communication System Experiment Platform")
+        self.title(f"{APP_EMOJI} Superposed / QAM Communication System Experiment Platform")
         self._icon, self._icon_ico = _create_emoji_icon(APP_EMOJI)
         if self._icon_ico is not None and sys.platform == "win32":
             try:
@@ -1407,7 +1529,7 @@ class SuperpositionGuiApp(tk.Tk):
 
         header = tk.Frame(self, bg=COLOR_BG)
         header.pack(fill=tk.X, padx=16, pady=(14, 6))
-        ttk.Label(header, text=f"{APP_EMOJI} Superposed 16QAM Communication System Experiment Platform",
+        ttk.Label(header, text=f"{APP_EMOJI} Superposed / QAM Communication System Experiment Platform",
                   style="Title.TLabel").pack(side=tk.LEFT)
         self.pill_runs = ttk.Label(header, style="Pill.TLabel")
         self.pill_runs.pack(side=tk.RIGHT, padx=(8, 0))
@@ -1457,6 +1579,10 @@ class SuperpositionGuiApp(tk.Tk):
         tab5 = ScopePanel(self.notebook, self)
         self.notebook.add(tab5, text="  📟 示波器  ")
         self.panel_scope = tab5
+
+        tab6 = DualKeithley2400Panel(self.notebook, self)
+        self.notebook.add(tab6, text="  ⚡ 源表 (3x2400)  ")
+        self.panel_smu = tab6
 
         self.notebook.select(3)
 
@@ -1523,6 +1649,7 @@ class SuperpositionGuiApp(tk.Tk):
         rec = self._record_by_run.get(run_id)
         if rec:
             self.metrics_var.set(
+                f"模式 {rec.get('modulation_mode', 'superposed')} | "
                 f"符号数 {rec.get('datano', '-')} | "
                 f"种子 {rec.get('seed', '-')} | "
                 f"SNR {rec.get('snr_db', 0):.1f} dB | "
@@ -1577,7 +1704,7 @@ class SuperpositionGuiApp(tk.Tk):
 
         if sym is not None:
             ax_const.plot(sym.real, sym.imag, "b.", alpha=0.5)
-            ax_const.set_title("发射叠加星座图（PAM6 x PAM6）")
+            ax_const.set_title("发射星座图")
             ax_const.set_xlabel("同相 I")
             ax_const.set_ylabel("正交 Q")
             ax_const.grid(True)
@@ -1592,10 +1719,15 @@ class SuperpositionGuiApp(tk.Tk):
                                  else tk.DISABLED)
 
     def _on_close(self):
-        """Clean up the oscilloscope connection before exit."""
+        """Clean up the oscilloscope and source-meter connections before exit."""
         try:
             if hasattr(self, "panel_scope"):
                 self.panel_scope.on_close()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "panel_smu"):
+                self.panel_smu.on_close()
         except Exception:
             pass
         self.destroy()

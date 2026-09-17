@@ -12,6 +12,7 @@ from typing import Optional
 import numpy as np
 
 import config
+import instrument_discovery as instr_disc
 
 
 class ScopeError(RuntimeError):
@@ -23,6 +24,8 @@ class KeysightScope:
 
     def __init__(self, visa_addr: str = config.OSC_VISA_ADDR,
                  timeout_ms: int = 10_000):
+        if visa_addr is None or visa_addr.lower() == "auto":
+            visa_addr = instr_disc.auto_detect_scope() or config.OSC_VISA_ADDR
         self.visa_addr = visa_addr
         self.timeout_ms = timeout_ms
         self._rm = None

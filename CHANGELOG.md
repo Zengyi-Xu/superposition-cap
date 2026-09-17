@@ -1,5 +1,16 @@
 # 开发日志
 
+## 2026-09-17
+
+### 改写：AWG 控制从 Keysight M8190A 改为 Tektronix AWG520（GPIB）
+- `awg_m8190a.py`：整体替换为 AWG520 控制器，使用 GPIB 地址连接，
+  通过 `MMEM:DATA` + MAGIC 1000 格式下载波形，命令集参考 Qcodes 社区驱动。
+- `download_two_channels(data1, data2)` 保持签名兼容，去掉 M8190A 专用
+  `output_route` 参数。
+- `config.py`：`AWG_VISA_ADDR` 改为 `GPIB0::1::INSTR`，移除 `AWG_OUTPUT_ROUTE`。
+- `superposition_gui.py`：AWG 卡片改为 AWG520，去掉输出路径选择。
+- `lowcode/nodes.py`：AWG 双通道下载节点描述与参数同步更新。
+
 ## 2026-09-16
 
 ### 修复：BER 恒为 0 的严重 bug
