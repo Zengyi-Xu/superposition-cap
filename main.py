@@ -72,10 +72,13 @@ def run_experiment(datano: int = cfg.DATANO,
     # ---- 传输速率 ----
     mod_params = core.get_modulation_params(modulation_mode)
     bits_per_symbol = 2 * int(mod_params["bits_per_dim"])
-    symbol_rate_mhz = awg_sample_rate_ms / cfg.UPSAMPLENO
-    data_rate_mbps = symbol_rate_mhz * bits_per_symbol
+    upsampleno = cfg.UPSAMPLENO
+    bandwidth_mhz = awg_sample_rate_ms / upsampleno
+    data_rate_mbps = bandwidth_mhz * bits_per_symbol
+    log(f"带宽: {bandwidth_mhz:.1f} MHz "
+        f"(AWG {awg_sample_rate_ms:.0f} MSa/s ÷ {upsampleno} 倍上采样)")
     log(f"传输速率: {data_rate_mbps:.1f} Mbps "
-        f"({symbol_rate_mhz:.1f} Msymbol/s × {bits_per_symbol} bits/symbol)")
+        f"({bandwidth_mhz:.1f} Msymbol/s × {bits_per_symbol} bits/symbol)")
 
     # ---- 信道 / 接收波形获取 ----
     if data_source == "virtual":
@@ -198,6 +201,8 @@ def run_experiment(datano: int = cfg.DATANO,
         "numof_ts": numof_ts,
         "sync_offset": int(offset),
         "awg_sample_rate_ms": awg_sample_rate_ms,
+        "upsampleno": upsampleno,
+        "bandwidth_mhz": bandwidth_mhz,
         "bits_per_symbol": bits_per_symbol,
         "data_rate_mbps": data_rate_mbps,
         "ber_pam6_1": ber_pam6_1,

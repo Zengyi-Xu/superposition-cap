@@ -166,6 +166,25 @@ def _persist_setting(key: str, value) -> None:
     save_settings({key: value})
 
 
+def _rate_info(rec) -> tuple:
+    """从记录提取 (速率 Mbps, AWG 采样率 MSa/s, 上采样倍数, 带宽 MHz)，兼容旧记录。"""
+    rate = rec.get("data_rate_mbps", 0) or 0
+    awg = rec.get("awg_sample_rate_ms", 0) or 0
+    up = rec.get("upsampleno", 0) or cfg.UPSAMPLENO
+    bw = rec.get("bandwidth_mhz", 0) or (awg / up if awg else 0)
+    return rate, awg, up, bw
+
+
+def _rate_cell(rec) -> str:
+    """结果表格“速率”列：速率 (采样率/×上采样/带宽) 同一列展示。"""
+    rate, awg, up, bw = _rate_info(rec)
+    if not rate:
+        return "N/A"
+    if awg and bw:
+        return f"{rate:.0f} ({awg:.0f}/×{up}/{bw:.0f}M)"
+    return f"{rate:.0f}"
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # High-DPI adaptation (must be called before creating Tk)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -875,7 +894,7 @@ class ResultsPanel(ttk.Frame):
         "src": ("Source", 80),
         "datano": ("Symbols", 80),
         "snr": ("SNR (dB)", 80),
-        "rate": ("速率 Mbps", 90),
+        "rate": ("速率 Mbps (采样率/×上采样/带宽)", 235),
         "ber1": ("BER 带1", 110),
         "ber2": ("BER 带2", 110),
         "ber_avg": ("平均 BER", 110),
@@ -922,13 +941,12 @@ class ResultsPanel(ttk.Frame):
             ber1 = rec.get("ber_band1", np.nan)
             ber2 = rec.get("ber_band2", np.nan)
             ber_avg = rec.get("ber_avg", np.nan)
-            rate = rec.get("data_rate_mbps", 0)
             row = (
                 run_id, ts,
                 rec.get("data_source", ""),
                 rec.get("datano", ""),
                 f"{rec.get('snr_db', 0):.1f}",
-                f"{rate:.0f}" if rate else "N/A",
+                _rate_cell(rec),
                 f"{ber1:.3e}" if ber1 is not None and not np.isnan(ber1) else "N/A",
                 f"{ber2:.3e}" if ber2 is not None and not np.isnan(ber2) else "N/A",
                 f"{ber_avg:.3e}" if ber_avg is not None and not np.isnan(ber_avg) else "N/A",
@@ -989,11 +1007,17 @@ class RunPanel(ttk.Frame):
         self._queue = queue.Queue()
         self._thread: Optional[threading.Thread] = None
 
-        # 左右分栏：左侧可滚动（参数/AWG/优化卡片），右侧固定运行日志
-        left_frame = tk.Frame(self, bg=COLOR_BG)
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
-        right_frame = tk.Frame(self, bg=COLOR_BG)
-        right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
+        # 左右分栏：左侧可滚动（参数/AWG/优化卡片），右侧固定运行日志；分隔条可拖动
+        paned = tk.PanedWindow(self, orient=tk.HORIZONTAL, bg=COLOR_BG,
+                               sashwidth=5, sashrelief=tk.FLAT, bd=0)
+        paned.pack(fill=tk.BOTH, expand=True)
+        left_frame = tk.Frame(paned, bg=COLOR_BG)
+        right_frame = tk.Frame(paned, bg=COLOR_BG)
+        paned.add(left_frame, minsize=620, stretch="always")
+        paned.add(right_frame, minsize=440, stretch="always")
+        self._paned = paned
+        self.after(80, lambda: paned.sash_place(
+            0, int(paned.winfo_width() * 0.60), 1))
 
         # 左侧滚动画布
         left_canvas = tk.Canvas(left_frame, bg=COLOR_BG, highlightthickness=0)
@@ -1027,109 +1051,113 @@ class RunPanel(ttk.Frame):
         # ── Parameter card ───────────────────────────────────────────
         opt = ttk.LabelFrame(scrollable_frame, text=" 实验参数 ")
         opt.pack(fill=tk.X, padx=2, pady=(2, 4))
+        for c in (1, 3, 5):
+            opt.columnconfigure(c, weight=1, uniform="param_entry")
 
         ttk.Label(opt, text="数据源:", style="Card.TLabel"
-                  ).grid(row=0, column=0, sticky=tk.W, padx=12, pady=(10, 4))
+                  ).grid(row=0, column=0, sticky=tk.W, padx=(10, 2), pady=(10, 4))
         self.src_var = tk.StringVar(value=_setting_str("DATA_SOURCE", cfg.DATA_SOURCE))
         self.src_combo = ttk.Combobox(
             opt, textvariable=self.src_var,
             values=["virtual", "file", "scope"],
-            state="readonly", width=16)
-        self.src_combo.grid(row=0, column=1, sticky=tk.W, padx=(4, 16), pady=(10, 4))
+            state="readonly", width=12)
+        self.src_combo.grid(row=0, column=1, sticky=tk.EW, padx=(2, 12), pady=(10, 4))
         self.src_combo.bind("<<ComboboxSelected>>", self._on_src_change)
 
-        ttk.Label(opt, text="符号数:", style="Card.TLabel"
-                  ).grid(row=0, column=2, sticky=tk.W, padx=12, pady=(10, 4))
-        self.datano_var = tk.IntVar(value=_setting_int("DATANO", cfg.DATANO))
-        self.datano_spin = tk.Spinbox(opt, from_=1024, to=1024 * 512, increment=1024,
-                                      textvariable=self.datano_var, width=16)
-        self.datano_spin.grid(row=0, column=3, sticky=tk.W, padx=(4, 16), pady=(10, 4))
-        self._bind_spinbox(self.datano_spin, self.datano_var, "DATANO", int)
-
         ttk.Label(opt, text="调制模式:", style="Card.TLabel"
-                  ).grid(row=0, column=4, sticky=tk.W, padx=12, pady=(10, 4))
+                  ).grid(row=0, column=2, sticky=tk.W, padx=(10, 2), pady=(10, 4))
         self.mod_var = tk.StringVar(value=_setting_str("MODULATION_MODE", cfg.MODULATION_MODE))
         self.mod_combo = ttk.Combobox(
             opt, textvariable=self.mod_var,
             values=core.SUPPORTED_MODULATIONS,
-            state="readonly", width=16)
-        self.mod_combo.grid(row=0, column=5, sticky=tk.W, padx=(4, 16), pady=(10, 4))
+            state="readonly", width=12)
+        self.mod_combo.grid(row=0, column=3, sticky=tk.EW, padx=(2, 12), pady=(10, 4))
         self.mod_combo.bind("<<ComboboxSelected>>", self._on_mod_change)
 
-        ttk.Label(opt, text="信噪比 (dB):", style="Card.TLabel"
-                  ).grid(row=1, column=0, sticky=tk.W, padx=12, pady=4)
-        self.snr_var = tk.DoubleVar(value=_setting_float("SNR_DB", cfg.SNR_DB))
-        self.snr_spin = tk.Spinbox(opt, from_=0.0, to=50.0, increment=0.5,
-                                   textvariable=self.snr_var, width=16)
-        self.snr_spin.grid(row=1, column=1, sticky=tk.W, padx=(4, 16), pady=4)
-        self._bind_spinbox(self.snr_spin, self.snr_var, "SNR_DB", float)
+        ttk.Label(opt, text="符号数:", style="Card.TLabel"
+                  ).grid(row=0, column=4, sticky=tk.W, padx=(10, 2), pady=(10, 4))
+        self.datano_var = tk.IntVar(value=_setting_int("DATANO", cfg.DATANO))
+        self.datano_spin = tk.Spinbox(opt, from_=1024, to=1024 * 512, increment=1024,
+                                      textvariable=self.datano_var, width=12)
+        self.datano_spin.grid(row=0, column=5, sticky=tk.EW, padx=(2, 12), pady=(10, 4))
+        self._bind_spinbox(self.datano_spin, self.datano_var, "DATANO", int)
 
         ttk.Label(opt, text="随机种子:", style="Card.TLabel"
-                  ).grid(row=1, column=2, sticky=tk.W, padx=12, pady=4)
+                  ).grid(row=1, column=0, sticky=tk.W, padx=(10, 2), pady=4)
         self.seed_var = tk.IntVar(value=_setting_int("SEED", cfg.SEED_BAND1))
-        self.seed_spin = tk.Spinbox(opt, from_=0, to=10000, textvariable=self.seed_var, width=16)
-        self.seed_spin.grid(row=1, column=3, sticky=tk.W, padx=(4, 16), pady=4)
+        self.seed_spin = tk.Spinbox(opt, from_=0, to=10000, textvariable=self.seed_var, width=12)
+        self.seed_spin.grid(row=1, column=1, sticky=tk.EW, padx=(2, 12), pady=4)
         self._bind_spinbox(self.seed_spin, self.seed_var, "SEED", int)
 
+        ttk.Label(opt, text="信噪比 (dB):", style="Card.TLabel"
+                  ).grid(row=1, column=2, sticky=tk.W, padx=(10, 2), pady=4)
+        self.snr_var = tk.DoubleVar(value=_setting_float("SNR_DB", cfg.SNR_DB))
+        self.snr_spin = tk.Spinbox(opt, from_=0.0, to=50.0, increment=0.5,
+                                   textvariable=self.snr_var, width=12)
+        self.snr_spin.grid(row=1, column=3, sticky=tk.EW, padx=(2, 12), pady=4)
+        self._bind_spinbox(self.snr_spin, self.snr_var, "SNR_DB", float)
+
+        ttk.Label(opt, text="训练符号数:", style="Card.TLabel"
+                  ).grid(row=1, column=4, sticky=tk.W, padx=(10, 2), pady=4)
+        self.ts_var = tk.IntVar(value=_setting_int("NUMOF_TS", cfg.NUMOF_TS))
+        self.ts_spin = tk.Spinbox(opt, from_=100, to=20000, increment=100,
+                                  textvariable=self.ts_var, width=12)
+        self.ts_spin.grid(row=1, column=5, sticky=tk.EW, padx=(2, 12), pady=4)
+        self._bind_spinbox(self.ts_spin, self.ts_var, "NUMOF_TS", int)
+
         ttk.Label(opt, text="LMS 抽头数:", style="Card.TLabel"
-                  ).grid(row=2, column=0, sticky=tk.W, padx=12, pady=4)
+                  ).grid(row=2, column=0, sticky=tk.W, padx=(10, 2), pady=4)
         self.taps_var = tk.IntVar(value=_setting_int("LMS_TAPS", cfg.LMS_TAPS))
         self.taps_spin = tk.Spinbox(opt, from_=3, to=51, increment=2,
-                                    textvariable=self.taps_var, width=16)
-        self.taps_spin.grid(row=2, column=1, sticky=tk.W, padx=(4, 16), pady=4)
+                                    textvariable=self.taps_var, width=12)
+        self.taps_spin.grid(row=2, column=1, sticky=tk.EW, padx=(2, 12), pady=4)
         self._bind_spinbox(self.taps_spin, self.taps_var, "LMS_TAPS", int)
 
         ttk.Label(opt, text="LMS 步长 μ1:", style="Card.TLabel"
-                  ).grid(row=2, column=2, sticky=tk.W, padx=12, pady=4)
+                  ).grid(row=2, column=2, sticky=tk.W, padx=(10, 2), pady=4)
         self.mu1_var = tk.DoubleVar(value=_setting_float("LMS_MU1", cfg.LMS_MU1))
         self.mu1_spin = tk.Spinbox(opt, from_=0.0001, to=1.0, increment=0.0005,
-                                   textvariable=self.mu1_var, width=16)
-        self.mu1_spin.grid(row=2, column=3, sticky=tk.W, padx=(4, 16), pady=4)
+                                   textvariable=self.mu1_var, width=12)
+        self.mu1_spin.grid(row=2, column=3, sticky=tk.EW, padx=(2, 12), pady=4)
         self._bind_spinbox(self.mu1_spin, self.mu1_var, "LMS_MU1", float)
 
         ttk.Label(opt, text="LMS 步长 μ2:", style="Card.TLabel"
-                  ).grid(row=3, column=0, sticky=tk.W, padx=12, pady=4)
+                  ).grid(row=2, column=4, sticky=tk.W, padx=(10, 2), pady=4)
         self.mu2_var = tk.DoubleVar(value=_setting_float("LMS_MU2", cfg.LMS_MU2))
         self.mu2_spin = tk.Spinbox(opt, from_=0.0001, to=1.0, increment=0.0005,
-                                   textvariable=self.mu2_var, width=16)
-        self.mu2_spin.grid(row=3, column=1, sticky=tk.W, padx=(4, 16), pady=4)
+                                   textvariable=self.mu2_var, width=12)
+        self.mu2_spin.grid(row=2, column=5, sticky=tk.EW, padx=(2, 12), pady=4)
         self._bind_spinbox(self.mu2_spin, self.mu2_var, "LMS_MU2", float)
 
-        ttk.Label(opt, text="训练符号数:", style="Card.TLabel"
-                  ).grid(row=3, column=2, sticky=tk.W, padx=12, pady=4)
-        self.ts_var = tk.IntVar(value=_setting_int("NUMOF_TS", cfg.NUMOF_TS))
-        self.ts_spin = tk.Spinbox(opt, from_=100, to=20000, increment=100,
-                                  textvariable=self.ts_var, width=16)
-        self.ts_spin.grid(row=3, column=3, sticky=tk.W, padx=(4, 16), pady=4)
-        self._bind_spinbox(self.ts_spin, self.ts_var, "NUMOF_TS", int)
-
         ttk.Label(opt, text="接收波形 (rx_*.txt):", style="Card.TLabel"
-                  ).grid(row=4, column=0, sticky=tk.W, padx=12, pady=4)
+                  ).grid(row=3, column=0, sticky=tk.W, padx=(10, 2), pady=4)
         self.rxfile_var = tk.StringVar(value=_setting_str("RX_FILE", ""))
-        self.rxfile_entry = ttk.Entry(opt, textvariable=self.rxfile_var, width=20)
-        self.rxfile_entry.grid(row=4, column=1, sticky=tk.W, padx=(4, 4), pady=4)
+        self.rxfile_entry = ttk.Entry(opt, textvariable=self.rxfile_var)
+        self.rxfile_entry.grid(row=3, column=1, columnspan=4, sticky=tk.EW,
+                               padx=(2, 4), pady=4)
         self._bind_entry(self.rxfile_entry, self.rxfile_var, "RX_FILE")
         self.rxfile_btn = ttk.Button(opt, text="浏览…", command=self._browse_rx)
-        self.rxfile_btn.grid(row=4, column=2, sticky=tk.W, padx=(0, 16), pady=4)
+        self.rxfile_btn.grid(row=3, column=5, sticky=tk.EW, padx=(2, 12), pady=4)
 
         ttk.Label(opt, text="示波器地址:", style="Card.TLabel"
-                  ).grid(row=5, column=0, sticky=tk.W, padx=12, pady=4)
+                  ).grid(row=4, column=0, sticky=tk.W, padx=(10, 2), pady=4)
         self.oscaddr_var = tk.StringVar(value=_setting_str("OSC_VISA_ADDR", cfg.OSC_VISA_ADDR))
-        self.oscaddr_entry = ttk.Entry(opt, textvariable=self.oscaddr_var, width=24)
-        self.oscaddr_entry.grid(row=5, column=1, sticky=tk.W, padx=(4, 4), pady=4)
+        self.oscaddr_entry = ttk.Entry(opt, textvariable=self.oscaddr_var)
+        self.oscaddr_entry.grid(row=4, column=1, columnspan=4, sticky=tk.EW,
+                                padx=(2, 4), pady=4)
         self._bind_entry(self.oscaddr_entry, self.oscaddr_var, "OSC_VISA_ADDR",
                          on_save=lambda v: _persist_addresses(osc_addr=v))
         ttk.Button(opt, text="自动识别", command=self._auto_detect_scope
-                   ).grid(row=5, column=2, sticky=tk.W, padx=(0, 4), pady=4)
+                   ).grid(row=4, column=5, sticky=tk.EW, padx=(2, 12), pady=4)
 
         ttk.Label(opt, text="示波器通道:", style="Card.TLabel"
-                  ).grid(row=5, column=3, sticky=tk.W, padx=12, pady=4)
+                  ).grid(row=5, column=0, sticky=tk.W, padx=(10, 2), pady=4)
         self.oscchan_var = tk.StringVar(value=_setting_str("OSC_CHANNEL", cfg.OSC_CHANNEL))
         self.oscchan_combo = ttk.Combobox(
             opt, textvariable=self.oscchan_var,
             values=["CHAN1", "CHAN2", "CHAN3", "CHAN4"],
             state="readonly", width=10)
-        self.oscchan_combo.grid(row=5, column=4, sticky=tk.W, padx=(4, 4), pady=4)
+        self.oscchan_combo.grid(row=5, column=1, sticky=tk.EW, padx=(2, 12), pady=4)
         self.oscchan_combo.bind("<<ComboboxSelected>>",
                                 lambda _e: _persist_addresses(osc_channel=self.oscchan_var.get()))
 
@@ -1137,19 +1165,20 @@ class RunPanel(ttk.Frame):
         self.oscdual_check = ttk.Checkbutton(
             opt, text="双通道采集 (CH1+CH2)", variable=self.oscdual_var,
             command=self._on_oscdual_change)
-        self.oscdual_check.grid(row=5, column=5, sticky=tk.W, padx=(4, 16), pady=4)
+        self.oscdual_check.grid(row=5, column=2, columnspan=2, sticky=tk.W,
+                                padx=(10, 2), pady=4)
 
         ttk.Label(opt, text="示波器采样率 (MSa/s):", style="Card.TLabel"
-                  ).grid(row=6, column=0, sticky=tk.W, padx=12, pady=4)
+                  ).grid(row=5, column=4, sticky=tk.W, padx=(10, 2), pady=4)
         self.oscsrate_var = tk.DoubleVar(value=_setting_float("OSC_SAMPLE", cfg.OSC_SAMPLE))
         self.oscsrate_spin = tk.Spinbox(opt, from_=100, to=10000, increment=100,
-                                        textvariable=self.oscsrate_var, width=16)
-        self.oscsrate_spin.grid(row=6, column=1, sticky=tk.W, padx=(4, 16), pady=4)
+                                        textvariable=self.oscsrate_var, width=12)
+        self.oscsrate_spin.grid(row=5, column=5, sticky=tk.EW, padx=(2, 12), pady=4)
         self._bind_spinbox(self.oscsrate_spin, self.oscsrate_var, "OSC_SAMPLE", float)
 
         btn_bar = tk.Frame(opt, bg=COLOR_CARD)
-        btn_bar.grid(row=7, column=0, columnspan=6, sticky=tk.W,
-                     padx=12, pady=(4, 8))
+        btn_bar.grid(row=6, column=0, columnspan=6, sticky=tk.W,
+                     padx=10, pady=(6, 10))
         self.run_btn = ttk.Button(btn_bar, text="▶  运行仿真",
                                   style="Accent.TButton",
                                   command=self.start_run)
@@ -1166,77 +1195,85 @@ class RunPanel(ttk.Frame):
         # ── AWG520 card ──────────────────────────────────────────────
         awg_card = ttk.LabelFrame(scrollable_frame, text=" AWG520 波形下载 ")
         awg_card.pack(fill=tk.X, padx=2, pady=(2, 4))
+        for c in (1, 3, 5):
+            awg_card.columnconfigure(c, weight=1, uniform="awg_entry")
 
         ttk.Label(awg_card, text="AWG 地址:", style="Card.TLabel"
-                  ).grid(row=0, column=0, sticky=tk.W, padx=12, pady=(8, 4))
+                  ).grid(row=0, column=0, sticky=tk.W, padx=(10, 2), pady=(8, 4))
         self.awgaddr_var = tk.StringVar(value=_setting_str("AWG_VISA_ADDR", cfg.AWG_VISA_ADDR))
-        self.awgaddr_entry = ttk.Entry(awg_card, textvariable=self.awgaddr_var, width=36)
-        self.awgaddr_entry.grid(row=0, column=1, sticky=tk.W, padx=(4, 4), pady=(8, 4))
+        self.awgaddr_entry = ttk.Entry(awg_card, textvariable=self.awgaddr_var)
+        self.awgaddr_entry.grid(row=0, column=1, columnspan=4, sticky=tk.EW,
+                                padx=(2, 4), pady=(8, 4))
         self._bind_entry(self.awgaddr_entry, self.awgaddr_var, "AWG_VISA_ADDR",
                          on_save=lambda v: _persist_addresses(awg_addr=v))
         ttk.Button(awg_card, text="自动识别", command=self._auto_detect_awg
-                   ).grid(row=0, column=2, sticky=tk.W, padx=(0, 16), pady=(8, 4))
+                   ).grid(row=0, column=5, sticky=tk.EW, padx=(2, 12), pady=(8, 4))
 
         ttk.Label(awg_card, text="采样率 (MSa/s):", style="Card.TLabel"
-                  ).grid(row=1, column=0, sticky=tk.W, padx=12, pady=(4, 8))
+                  ).grid(row=1, column=0, sticky=tk.W, padx=(10, 2), pady=4)
         self.awgsrate_var = tk.DoubleVar(value=_setting_float("AWG_SAMPLE_RATE", cfg.AWG_SAMPLE))
         self.awgsrate_spin = tk.Spinbox(awg_card, from_=10, to=2000, increment=10,
                                         textvariable=self.awgsrate_var, width=8)
-        self.awgsrate_spin.grid(row=1, column=1, sticky=tk.W, padx=(4, 16), pady=(4, 8))
+        self.awgsrate_spin.grid(row=1, column=1, sticky=tk.EW, padx=(2, 12), pady=4)
         self._bind_spinbox(self.awgsrate_spin, self.awgsrate_var, "AWG_SAMPLE_RATE", float)
 
         ttk.Label(awg_card, text="CH1 幅度 Vpp:", style="Card.TLabel"
-                  ).grid(row=1, column=2, sticky=tk.W, padx=12, pady=(4, 8))
+                  ).grid(row=1, column=2, sticky=tk.W, padx=(10, 2), pady=4)
         self.awgvpp_ch1_var = tk.DoubleVar(value=_setting_float("AWG_VPP_CH1", cfg.AWG_VPP_CH1))
         self.awgvpp_ch1_spin = tk.Spinbox(awg_card, from_=0.02, to=2.0, increment=0.05,
                                           textvariable=self.awgvpp_ch1_var, width=8)
-        self.awgvpp_ch1_spin.grid(row=1, column=3, sticky=tk.W, padx=(4, 16), pady=(4, 8))
+        self.awgvpp_ch1_spin.grid(row=1, column=3, sticky=tk.EW, padx=(2, 12), pady=4)
         self._bind_spinbox(self.awgvpp_ch1_spin, self.awgvpp_ch1_var, "AWG_VPP_CH1", float)
 
-        self.awg_apply_btn = ttk.Button(awg_card, text="⚙ 应用输出设置",
-                                        command=self._apply_awg_output_settings)
-        self.awg_apply_btn.grid(row=1, column=4, sticky=tk.W, padx=(8, 4), pady=(4, 8))
+        ttk.Label(awg_card, text="CH2 幅度 Vpp:", style="Card.TLabel"
+                  ).grid(row=1, column=4, sticky=tk.W, padx=(10, 2), pady=4)
+        self.awgvpp_ch2_var = tk.DoubleVar(value=_setting_float("AWG_VPP_CH2", cfg.AWG_VPP_CH2))
+        self.awgvpp_ch2_spin = tk.Spinbox(awg_card, from_=0.02, to=2.0, increment=0.05,
+                                          textvariable=self.awgvpp_ch2_var, width=8)
+        self.awgvpp_ch2_spin.grid(row=1, column=5, sticky=tk.EW, padx=(2, 12), pady=4)
+        self._bind_spinbox(self.awgvpp_ch2_spin, self.awgvpp_ch2_var, "AWG_VPP_CH2", float)
 
         self.awg_combine_var = tk.BooleanVar(value=_setting_bool("AWG_COMBINE", False))
         self.awg_combine_check = ttk.Checkbutton(
             awg_card, text="叠加到单通道 (CH1)", variable=self.awg_combine_var,
             command=self._on_awg_combine_change)
-        self.awg_combine_check.grid(row=1, column=5, sticky=tk.W, padx=(4, 16), pady=(4, 8))
-
-        ttk.Label(awg_card, text="CH2 幅度 Vpp:", style="Card.TLabel"
-                  ).grid(row=2, column=2, sticky=tk.W, padx=12, pady=(4, 8))
-        self.awgvpp_ch2_var = tk.DoubleVar(value=_setting_float("AWG_VPP_CH2", cfg.AWG_VPP_CH2))
-        self.awgvpp_ch2_spin = tk.Spinbox(awg_card, from_=0.02, to=2.0, increment=0.05,
-                                          textvariable=self.awgvpp_ch2_var, width=8)
-        self.awgvpp_ch2_spin.grid(row=2, column=3, sticky=tk.W, padx=(4, 16), pady=(4, 8))
-        self._bind_spinbox(self.awgvpp_ch2_spin, self.awgvpp_ch2_var, "AWG_VPP_CH2", float)
-
-        self.awg_dl_btn = ttk.Button(awg_card, text="⬇ 生成并下载双通道波形",
-                                     style="Accent.TButton",
-                                     command=self._start_awg_download)
-        self.awg_dl_btn.grid(row=2, column=4, sticky=tk.W, padx=(8, 4), pady=(4, 8))
-        self.awg_start_btn = ttk.Button(awg_card, text="▶ 开始输出",
-                                        command=self._start_awg_output)
-        self.awg_start_btn.grid(row=2, column=5, sticky=tk.W, padx=(4, 12), pady=(4, 8))
+        self.awg_combine_check.grid(row=2, column=0, columnspan=3, sticky=tk.W,
+                                    padx=(10, 2), pady=4)
 
         self.awg_sync_var = tk.StringVar(value="请下载 AWG 波形")
         self.awg_sync_label = ttk.Label(
             awg_card, textvariable=self.awg_sync_var,
             style="DimCard.TLabel")
-        self.awg_sync_label.grid(row=3, column=0, columnspan=4,
-                                 sticky=tk.W, padx=12, pady=(4, 8))
-        self.awg_stop_btn = ttk.Button(awg_card, text="停止输出",
-                                       command=self._stop_awg)
-        self.awg_stop_btn.grid(row=3, column=4, sticky=tk.W, padx=(8, 4), pady=(4, 8))
-        self.awg_clear_btn = ttk.Button(awg_card, text="🗑 清空 AWG",
-                                        command=self._clear_awg)
-        self.awg_clear_btn.grid(row=3, column=5, sticky=tk.W, padx=(4, 12), pady=(4, 8))
+        self.awg_sync_label.grid(row=2, column=3, columnspan=3,
+                                 sticky=tk.W, padx=(10, 2), pady=4)
 
+        awg_btns = tk.Frame(awg_card, bg=COLOR_CARD)
+        awg_btns.grid(row=3, column=0, columnspan=6, sticky=tk.W,
+                      padx=10, pady=(4, 10))
+        self.awg_dl_btn = ttk.Button(awg_btns, text="⬇ 生成并下载波形",
+                                     style="Accent.TButton",
+                                     command=self._start_awg_download)
+        self.awg_dl_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.awg_start_btn = ttk.Button(awg_btns, text="▶ 开始输出",
+                                        command=self._start_awg_output)
+        self.awg_start_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.awg_stop_btn = ttk.Button(awg_btns, text="停止输出",
+                                       command=self._stop_awg)
+        self.awg_stop_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        awg_btns2 = tk.Frame(awg_card, bg=COLOR_CARD)
+        awg_btns2.grid(row=4, column=0, columnspan=6, sticky=tk.W,
+                       padx=10, pady=(0, 10))
+        self.awg_apply_btn = ttk.Button(awg_btns2, text="⚙ 应用输出设置",
+                                        command=self._apply_awg_output_settings)
+        self.awg_apply_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.awg_clear_btn = ttk.Button(awg_btns2, text="🗑 清空 AWG",
+                                        command=self._clear_awg)
+        self.awg_clear_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.awg_gen_only_btn = ttk.Button(
-            awg_card, text="⧉ 仅生成波形",
+            awg_btns2, text="⧉ 仅生成波形",
             command=self._generate_awg_waveform_only)
-        self.awg_gen_only_btn.grid(row=4, column=4, sticky=tk.W,
-                                   padx=(8, 4), pady=(4, 8))
+        self.awg_gen_only_btn.pack(side=tk.LEFT)
 
         self.awg_card = awg_card
         self._on_awg_combine_change()
@@ -1362,7 +1399,8 @@ class RunPanel(ttk.Frame):
         log_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         self.log_text = tk.Text(
             log_frame, wrap=tk.NONE, state=tk.DISABLED, width=60,
-            font=(FONT_MONO, 9),
+            font=(FONT_MONO, 10),
+            spacing1=0, spacing2=0, spacing3=0,
             bg="#0F172A", fg="#E2E8F0", bd=0, highlightthickness=0,
             insertbackground="#E2E8F0")
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -2104,8 +2142,10 @@ class SuperpositionGuiApp(tk.Tk):
         ttk.Button(inner, text="⟳ 刷新数据", command=self.reload_data
                    ).pack(side=tk.LEFT)
         self.metrics_var = tk.StringVar(value="")
-        ttk.Label(inner, textvariable=self.metrics_var, style="Metrics.TLabel"
-                  ).pack(side=tk.LEFT, padx=20)
+        metrics_row = tk.Frame(sel, bg=COLOR_CARD)
+        metrics_row.pack(fill=tk.X, padx=12, pady=(0, 10))
+        ttk.Label(metrics_row, textvariable=self.metrics_var, style="Metrics.TLabel"
+                  ).pack(side=tk.LEFT)
 
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
@@ -2196,8 +2236,10 @@ class SuperpositionGuiApp(tk.Tk):
             self.run_var.set(run_id)
         rec = self._record_by_run.get(run_id)
         if rec:
-            rate = rec.get('data_rate_mbps', 0)
-            rate_str = f"{rate:.0f} Mbps" if rate else "N/A"
+            rate, awg, up, bw = _rate_info(rec)
+            rate_str = (f"{rate:.0f} Mbps ({awg:.0f}/×{up}/{bw:.0f}M)"
+                        if rate and awg and bw else
+                        (f"{rate:.0f} Mbps" if rate else "N/A"))
             self.metrics_var.set(
                 f"模式 {rec.get('modulation_mode', 'superposed')} | "
                 f"符号数 {rec.get('datano', '-')} | "

@@ -362,10 +362,13 @@ def run_lms_coordinate_search(
 
     mod_params = core.get_modulation_params(modulation_mode)
     bits_per_symbol = 2 * int(mod_params["bits_per_dim"])
-    symbol_rate_mhz = (awg_sample_rate_ms or cfg.AWG_SAMPLE) / cfg.UPSAMPLENO
-    data_rate_mbps = symbol_rate_mhz * bits_per_symbol
+    upsampleno = cfg.UPSAMPLENO
+    bandwidth_mhz = (awg_sample_rate_ms or cfg.AWG_SAMPLE) / upsampleno
+    data_rate_mbps = bandwidth_mhz * bits_per_symbol
+    _to_log(f"带宽: {bandwidth_mhz:.1f} MHz "
+            f"(AWG {(awg_sample_rate_ms or cfg.AWG_SAMPLE):.0f} MSa/s ÷ {upsampleno} 倍上采样)", log)
     _to_log(f"传输速率: {data_rate_mbps:.1f} Mbps "
-            f"({symbol_rate_mhz:.1f} Msymbol/s × {bits_per_symbol} bits/symbol)", log)
+            f"({bandwidth_mhz:.1f} Msymbol/s × {bits_per_symbol} bits/symbol)", log)
 
     # ---- 加载并校验接收文件 ----
     rx_raw = np.loadtxt(rx_file)
@@ -413,6 +416,8 @@ def run_lms_coordinate_search(
             "numof_ts": numof_ts,
             "sync_offset": int(offset),
             "awg_sample_rate_ms": awg_sample_rate_ms or cfg.AWG_SAMPLE,
+            "upsampleno": upsampleno,
+            "bandwidth_mhz": bandwidth_mhz,
             "bits_per_symbol": bits_per_symbol,
             "data_rate_mbps": data_rate_mbps,
             **res,

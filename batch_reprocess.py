@@ -78,6 +78,7 @@ def reprocess(ber_threshold: float = BER_THRESHOLD, dry_run: bool = False) -> Tu
                 numof_ts=int(rec.get("numof_ts", cfg.NUMOF_TS)),
                 data_source="file",
                 rx_file=rx_file,
+                awg_sample_rate_ms=float(rec.get("awg_sample_rate_ms", cfg.AWG_SAMPLE)),
                 modulation_mode=rec.get("modulation_mode", cfg.MODULATION_MODE),
                 log=print,
             )

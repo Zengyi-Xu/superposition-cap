@@ -56,6 +56,9 @@ def save_record(run_id: str,
         f"信噪比: {full_record.get('snr_db', 'N/A')} dB",
         f"LMS 抽头/步长: {full_record.get('lms_taps', 'N/A')} / "
         f"{full_record.get('lms_mu1', 'N/A')}, {full_record.get('lms_mu2', 'N/A')}",
+        f"AWG 采样率: {full_record.get('awg_sample_rate_ms', 'N/A')} MSa/s / "
+        f"上采样: ×{full_record.get('upsampleno', 'N/A')} / "
+        f"带宽: {full_record.get('bandwidth_mhz', 'N/A')} MHz",
         f"传输速率: {full_record.get('data_rate_mbps', 'N/A')} Mbps",
         f"PAM6 带1 误码率: {full_record.get('ber_pam6_1', 'N/A')}",
         f"PAM6 带2 误码率: {full_record.get('ber_pam6_2', 'N/A')}",
