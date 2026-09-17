@@ -1,5 +1,50 @@
 # 开发日志
 
+## 2026-09-18
+
+### 新增：离线 LMS 参数自动优化
+- 新模块 `optimizer.py`：实现三轮坐标下降 LMS 优化。
+  - 第一轮：全范围坐标下降（taps → μ1 → μ2）。
+  - 第二轮：在已收敛 μ 上重新选择 taps。
+  - 第三轮：在第二轮最优值附近 1/3 ~ 3 倍 log 范围细化 μ。
+  - 评估次数远低于穷举网格，且能找到更优参数。
+- `superposition_gui.py`：Run Test 页新增“离线 LMS 参数优化”卡片，
+  支持设置 taps / μ1 / μ2 范围、log/linear 采样，优化完成后自动把最优参数写回当前设置。
+- 默认勾选“启用 LMS 参数扫参”。
+
+### 新增：批量重跑与记录清理脚本
+- `batch_reprocess.py`：批量重跑 `data_source=file` 的历史记录，复用原 run_id，
+  用当前代码更新实际 SNR 与 BER；BER 变差时保留旧记录并提示。
+- `cleanup_records.py`：删除仅有实验 ID 但对应波形文件（tx/rx/eq）已丢失的记录。
+
+### 改进：实际 SNR 估计与文件数据源 ID 复用
+- `main.py`：file / scope 数据源下，LMS 均衡后用 `recoverdata` 与参考符号计算实际 SNR，
+  覆盖原记录中的 `snr_db`；virtual 模式仍使用输入 SNR。
+- `superposition_gui.py`：file 数据源手动运行时，从 `rx_<run_id>.txt` 提取原 run_id，
+  不生成新 ID；BER 变差时不覆盖原记录。
+- SNR 输入框仅在 virtual 模式下可用。
+
+### 改进：AWG 控制与单通道叠加
+- `awg_m8190a.py`：
+  - `start()` 只启动已加载波形的通道，避免空通道导致无法输出。
+  - `apply_output_settings()` 更新采样率/Vpp 后自动运行已加载通道。
+  - 新增 `clear_waveforms()` 清空 AWG 波形并停止输出。
+- `superposition_gui.py`：AWG 卡片新增“开始输出”“应用输出设置”“清空 AWG”“仅生成波形”按钮，
+  并在调制方式/叠加方式变更后提示重新下载。
+- 新增 `settings.py` 持久化用户地址与运行参数。
+
+### 新增：结果表格“传输速率”列
+- `main.py` / `optimizer.py`：计算并记录 `data_rate_mbps`。
+- `superposition_gui.py`：Results 表格与顶部指标栏显示传输速率。
+- 所有历史记录已补填速率字段。
+
+### 修复与 UI 调整
+- `superposition_gui.py`：
+  - Run Test 页左侧参数/AWG/优化卡片改为可滚动区域，支持鼠标滚轮；右侧日志固定。
+  - 整体字体放大（基础 11pt），卡片间距收紧，1080P 下更整齐。
+  - 修复离线 file 模式误选 `eq_*.txt` 导致的 shape 广播错误，增加清晰提示。
+- `record.py`：文本摘要加入传输速率。
+
 ## 2026-09-17
 
 ### 改写：AWG 控制从 Keysight M8190A 改为 Tektronix AWG520（GPIB）

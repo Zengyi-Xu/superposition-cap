@@ -32,6 +32,10 @@ def run_experiment(datano: int = cfg.DATANO,
                    data_source: str = cfg.DATA_SOURCE,
                    rx_file: str = "",
                    osc_addr: str = cfg.OSC_VISA_ADDR,
+                   osc_channel: str = cfg.OSC_CHANNEL,
+                   osc_dual: bool = False,
+                   osc_sample_rate_ms: float = cfg.OSC_SAMPLE,
+                   awg_sample_rate_ms: float = cfg.AWG_SAMPLE,
                    modulation_mode: str = cfg.MODULATION_MODE,
                    run_id: str = None,
                    log=print) -> dict:
@@ -65,6 +69,14 @@ def run_experiment(datano: int = cfg.DATANO,
     write_wfm(tx["data2"], cfg.TXDATA_DIR / f"SuperposedPAM6_Tx2_{run_id}.wfm")
     log(f"发射波形已保存: {tx1_path.name}, {tx2_path.name} (+ .wfm)")
 
+    # ---- 传输速率 ----
+    mod_params = core.get_modulation_params(modulation_mode)
+    bits_per_symbol = 2 * int(mod_params["bits_per_dim"])
+    symbol_rate_mhz = awg_sample_rate_ms / cfg.UPSAMPLENO
+    data_rate_mbps = symbol_rate_mhz * bits_per_symbol
+    log(f"传输速率: {data_rate_mbps:.1f} Mbps "
+        f"({symbol_rate_mhz:.1f} Msymbol/s × {bits_per_symbol} bits/symbol)")
+
     # ---- 信道 / 接收波形获取 ----
     if data_source == "virtual":
         rx_raw = channel.vlc_channel(
@@ -74,15 +86,37 @@ def run_experiment(datano: int = cfg.DATANO,
             f"nonlinear={cfg.CHANNEL_NONLINEAR}")
     elif data_source == "file":
         rx_raw = np.loadtxt(rx_file)
+        if rx_raw.ndim > 1:
+            raise ValueError(
+                f"接收文件 {Path(rx_file).name} 是多列数据，看起来是均衡后的符号文件 "
+                f"(eq_*.txt)。离线处理需要选择原始接收波形文件 (rx_*.txt)。"
+            )
+        expected_len = datano * cfg.UPSAMPLENO
+        if len(rx_raw) < expected_len:
+            raise ValueError(
+                f"接收文件 {Path(rx_file).name} 长度 {len(rx_raw)} 远小于期望的原始波形长度 "
+                f"{expected_len}。请确认选择的是原始接收波形 (rx_*.txt)，而不是均衡结果 "
+                f"(eq_*.txt) 或符号文件。"
+            )
         log(f"从文件加载接收波形: {rx_file} ({len(rx_raw)} 点)")
     elif data_source == "scope":
-        from oscilloscope import acquire_waveform
-        result = acquire_waveform(visa_addr=osc_addr)
-        rx_raw = result["ydata"]
-        log(f"示波器采集完成: {result['channel']}, {len(rx_raw)} 点, "
-            f"srate={1 / result['preamble']['x_increment'] / 1e6:.0f} MSa/s")
-        rx_raw = resample_ratio(rx_raw, cfg.AWG_SAMPLE, cfg.OSC_SAMPLE)
-        log(f"重采样 {cfg.OSC_SAMPLE}->{cfg.AWG_SAMPLE} MSa/s: {len(rx_raw)} 点")
+        osc_srate_hz = osc_sample_rate_ms * 1e6
+        if osc_dual:
+            from oscilloscope import acquire_two_channels
+            result = acquire_two_channels(visa_addr=osc_addr, sample_rate=osc_srate_hz)
+            rx_raw = result["ydata_sum"]
+            ch_info = ", ".join(result["channels"])
+            log(f"示波器双通道采集完成: {ch_info}, 相加后 {len(rx_raw)} 点, "
+                f"srate={1 / result['preamble']['x_increment'] / 1e6:.0f} MSa/s")
+        else:
+            from oscilloscope import acquire_waveform
+            result = acquire_waveform(visa_addr=osc_addr, channel=osc_channel,
+                                      sample_rate=osc_srate_hz)
+            rx_raw = result["ydata"]
+            log(f"示波器采集完成: {result['channel']}, {len(rx_raw)} 点, "
+                f"srate={1 / result['preamble']['x_increment'] / 1e6:.0f} MSa/s")
+        rx_raw = resample_ratio(rx_raw, int(awg_sample_rate_ms), int(osc_sample_rate_ms))
+        log(f"重采样 {osc_sample_rate_ms:.0f}->{awg_sample_rate_ms:.0f} MSa/s: {len(rx_raw)} 点")
     else:
         raise ValueError(f"未知数据源: {data_source}")
 
@@ -106,9 +140,21 @@ def run_experiment(datano: int = cfg.DATANO,
     recoverdata = equ_data1 * avp1 + 1j * equ_data2 * avp2
     log(f"MIMO LMS 完成: taps={lms_taps}, mu=({lms_mu1}, {lms_mu2}), 训练 {numof_ts} 符号")
 
+    # ---- 实际 SNR 估计（file / scope 时使用均衡后符号计算）----
+    sl = slice(lms_taps - 1, datano - lms_taps)
+    if data_source != "virtual":
+        ref_symbols = v1 + 1j * v2
+        err_symbols = recoverdata[sl] - ref_symbols[sl]
+        signal_power = np.mean(np.abs(ref_symbols[sl]) ** 2)
+        noise_power = np.mean(np.abs(err_symbols) ** 2)
+        if noise_power > 0:
+            snr_db = float(10 * np.log10(signal_power / noise_power))
+        else:
+            snr_db = 99.0
+        log(f"实际 SNR: {snr_db:.2f} dB")
+
     # ---- 判决与解码 ----
     rx_dec1, rx_dec2 = core.demodulate_symbols(recoverdata, modulation_mode)
-    sl = slice(lms_taps - 1, datano - lms_taps)
 
     _, ber_band1 = core.biterr(rx_dec1[sl], decimal1[sl])
     _, ber_band2 = core.biterr(rx_dec2[sl], decimal2[sl])
@@ -151,6 +197,9 @@ def run_experiment(datano: int = cfg.DATANO,
         "lms_mu2": lms_mu2,
         "numof_ts": numof_ts,
         "sync_offset": int(offset),
+        "awg_sample_rate_ms": awg_sample_rate_ms,
+        "bits_per_symbol": bits_per_symbol,
+        "data_rate_mbps": data_rate_mbps,
         "ber_pam6_1": ber_pam6_1,
         "ber_pam6_2": ber_pam6_2,
         "ber_band1": ber_band1,
@@ -178,6 +227,13 @@ def main():
                         default=cfg.DATA_SOURCE)
     parser.add_argument("--rx-file", default="", help="data_source=file 时的接收波形路径")
     parser.add_argument("--osc-addr", default=cfg.OSC_VISA_ADDR)
+    parser.add_argument("--osc-channel", default=cfg.OSC_CHANNEL)
+    parser.add_argument("--osc-dual", action="store_true",
+                        help="同时采集示波器 CH1 和 CH2 并相加")
+    parser.add_argument("--osc-sample-rate", type=float, default=cfg.OSC_SAMPLE,
+                        help="示波器采样率（MSa/s）")
+    parser.add_argument("--awg-sample-rate", type=float, default=cfg.AWG_SAMPLE,
+                        help="AWG 采样率（MSa/s），也用于重采样")
     parser.add_argument("--snr", type=float, default=cfg.SNR_DB)
     parser.add_argument("--seed", type=int, default=cfg.SEED_BAND1)
     parser.add_argument("--datano", type=int, default=cfg.DATANO)
@@ -195,6 +251,9 @@ def main():
         lms_taps=args.lms_taps, lms_mu1=args.lms_mu1, lms_mu2=args.lms_mu2,
         numof_ts=args.numof_ts, data_source=args.data_source,
         rx_file=args.rx_file, osc_addr=args.osc_addr,
+        osc_channel=args.osc_channel, osc_dual=args.osc_dual,
+        osc_sample_rate_ms=args.osc_sample_rate,
+        awg_sample_rate_ms=args.awg_sample_rate,
         modulation_mode=args.modulation)
     save_record(record["run_id"], record, cfg.RECORD_DIR)
 

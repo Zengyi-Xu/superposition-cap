@@ -83,7 +83,7 @@ CHANNEL_NONLINEAR = False         # 是否启用弱 LED 非线性
 # ---------------------------------------------------------------------------
 # 硬件地址（Keysight 示波器，TCP/IP，与 MATLAB 中 tcpip('169.254.140.83',5025) 对应）
 # ---------------------------------------------------------------------------
-OSC_VISA_ADDR = "TCPIP0::169.254.140.83::5025::SOCKET"
+OSC_VISA_ADDR = "TCPIP0::169.254.174.176::5025::SOCKET"
 OSC_CHANNEL = "CHAN1"
 OSC_SAMPLE_RATE = 2000e6          # :ACQUIRE:SRATE
 OSC_TIMEBASE_SCALE = 60e-6        # :TIMEBASE:SCALE
@@ -92,7 +92,9 @@ OSC_TIMEBASE_SCALE = 60e-6        # :TIMEBASE:SCALE
 # Tektronix AWG520 任意波形发生器（GPIB）
 # ---------------------------------------------------------------------------
 AWG_SAMPLE_RATE = AWG_SAMPLE * 1e6  # AWG 采样率（Hz），= 900 MSa/s
-AWG_VPP = 0.5                     # 输出幅度（Vpp）
+AWG_VPP = 0.5                     # 默认输出幅度（Vpp，两路未单独设置时生效）
+AWG_VPP_CH1 = 0.5                 # CH1 输出幅度（Vpp）
+AWG_VPP_CH2 = 0.5                 # CH2 输出幅度（Vpp）
 # VISA 地址（根据 GPIB 卡与仪器地址修改，例如 GPIB0::1::INSTR）：
 AWG_VISA_ADDR = "GPIB0::1::INSTR"
 

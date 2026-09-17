@@ -237,7 +237,9 @@ def _fn_awg_download_dual(inputs, params, ctx):
     w2 = np.asarray(inputs["wave2"]).ravel()
     awg_m8190a.download_two_channels(
         w1, w2,
-        vpp=float(params.get("vpp", config.AWG_VPP)),
+        sample_rate=float(params.get("sample_rate", config.AWG_SAMPLE_RATE)),
+        vpp_ch1=float(params.get("vpp_ch1", config.AWG_VPP_CH1)),
+        vpp_ch2=float(params.get("vpp_ch2", config.AWG_VPP_CH2)),
         visa_addr=str(params.get("visa_addr", config.AWG_VISA_ADDR)),
         log=ctx.log,
     )
@@ -247,18 +249,31 @@ def _fn_awg_download_dual(inputs, params, ctx):
 
 def _fn_scope_capture(inputs, params, ctx):
     """从 Keysight 示波器采集波形并重采样到 AWG 速率（需硬件）。"""
-    from oscilloscope import acquire_waveform
     from utils import resample_ratio
     addr = str(params.get("visa_addr", config.OSC_VISA_ADDR))
-    result = acquire_waveform(
-        visa_addr=addr,
-        channel=str(params.get("channel", config.OSC_CHANNEL)),
-        sample_rate=float(params.get("sample_rate", config.OSC_SAMPLE_RATE)),
-        timebase_scale=float(params.get("timebase_scale", config.OSC_TIMEBASE_SCALE)),
-    )
-    rx = result["ydata"]
-    rx = resample_ratio(rx, config.OSC_SAMPLE, config.AWG_SAMPLE)
-    ctx.log(f"示波器采集完成: {result['channel']}, {len(rx)} 点（已重采样到 "
+    dual = bool(params.get("dual", False))
+    if dual:
+        from oscilloscope import acquire_two_channels
+        result = acquire_two_channels(
+            visa_addr=addr,
+            channels=("CHAN1", "CHAN2"),
+            sample_rate=float(params.get("sample_rate", config.OSC_SAMPLE_RATE)),
+            timebase_scale=float(params.get("timebase_scale", config.OSC_TIMEBASE_SCALE)),
+        )
+        rx = result["ydata_sum"]
+        ch_info = ", ".join(result["channels"])
+    else:
+        from oscilloscope import acquire_waveform
+        result = acquire_waveform(
+            visa_addr=addr,
+            channel=str(params.get("channel", config.OSC_CHANNEL)),
+            sample_rate=float(params.get("sample_rate", config.OSC_SAMPLE_RATE)),
+            timebase_scale=float(params.get("timebase_scale", config.OSC_TIMEBASE_SCALE)),
+        )
+        rx = result["ydata"]
+        ch_info = result["channel"]
+    rx = resample_ratio(rx, config.AWG_SAMPLE, config.OSC_SAMPLE)
+    ctx.log(f"示波器采集完成: {ch_info}, {len(rx)} 点（已重采样到 "
             f"{config.AWG_SAMPLE} MSa/s）")
     return {"waveform": rx}
 
@@ -616,7 +631,9 @@ def _register_all():
          PortDef("wave2", "CH2 波形", "waveform")],
         [],
         [ParamDef("visa_addr", "VISA 地址", "str", config.AWG_VISA_ADDR),
-         ParamDef("vpp", "幅度 Vpp", "float", config.AWG_VPP)],
+         ParamDef("sample_rate", "采样率 (Hz)", "float", config.AWG_SAMPLE_RATE),
+         ParamDef("vpp_ch1", "CH1 幅度 Vpp", "float", config.AWG_VPP_CH1),
+         ParamDef("vpp_ch2", "CH2 幅度 Vpp", "float", config.AWG_VPP_CH2)],
         _fn_awg_download_dual))
 
     register(NodeDef(
@@ -626,6 +643,7 @@ def _register_all():
         [ParamDef("visa_addr", "VISA 地址", "str", config.OSC_VISA_ADDR),
          ParamDef("channel", "通道", "choice", config.OSC_CHANNEL,
                   ["CHAN1", "CHAN2", "CHAN3", "CHAN4"]),
+         ParamDef("dual", "双通道采集 (CH1+CH2)", "bool", False),
          ParamDef("sample_rate", "采样率 (Hz)", "float", config.OSC_SAMPLE_RATE),
          ParamDef("timebase_scale", "时基 (s)", "float", config.OSC_TIMEBASE_SCALE)],
         _fn_scope_capture))

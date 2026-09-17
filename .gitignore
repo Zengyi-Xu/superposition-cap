@@ -29,5 +29,9 @@ data/records/
 # 低代码平台每次运行的临时输出
 data/lowcode_runs/
 
+# 用户本地设置
+log/
+data/settings.json
+
 # 打包/备份文件
 *.zip

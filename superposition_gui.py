@@ -40,10 +40,11 @@ import config as cfg
 import main as main_flow
 import superposition_core as core
 import awg_m8190a
+import optimizer
 import instrument_discovery as instr_disc
 from record import generate_run_id, save_record
-from oscilloscope import KeysightScope, ScopeError
 from source_meter_panel import DualKeithley2400Panel
+from settings import load_settings, save_settings
 
 try:
     import openpyxl
@@ -103,6 +104,66 @@ TXDATA_DIR = cfg.TXDATA_DIR
 RXDATA_DIR = cfg.RXDATA_DIR
 
 APP_EMOJI = "🔀"  # emoji used for window icon and title
+
+# 加载用户保存的地址/端口默认值（覆盖 config.py 中的硬编码）
+_USER_SETTINGS = load_settings()
+
+
+def _persist_addresses(osc_addr: str = None, awg_addr: str = None,
+                       osc_channel: str = None, osc_dual: bool = None) -> None:
+    """把当前 OSC/AWG 地址、OSC 通道/双通道状态保存到 data/settings.json。"""
+    updates = {}
+    if osc_addr is not None:
+        updates["OSC_VISA_ADDR"] = osc_addr
+    if awg_addr is not None:
+        updates["AWG_VISA_ADDR"] = awg_addr
+    if osc_channel is not None:
+        updates["OSC_CHANNEL"] = osc_channel
+    if osc_dual is not None:
+        updates["OSC_DUAL"] = bool(osc_dual)
+    if updates:
+        save_settings(updates)
+
+
+def _setting_bool(key: str, default: bool = False) -> bool:
+    """从已保存设置中读取布尔值，兼容旧版字符串 'True'/'False'。"""
+    value = _USER_SETTINGS.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ("true", "1", "yes")
+    return bool(value)
+
+
+def _setting_int(key: str, default: int = 0) -> int:
+    """从已保存设置中读取整数。"""
+    value = _USER_SETTINGS.get(key, default)
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _setting_float(key: str, default: float = 0.0) -> float:
+    """从已保存设置中读取浮点数。"""
+    value = _USER_SETTINGS.get(key, default)
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _setting_str(key: str, default: str = "") -> str:
+    """从已保存设置中读取字符串。"""
+    value = _USER_SETTINGS.get(key, default)
+    if value is None:
+        return default
+    return str(value).strip()
+
+
+def _persist_setting(key: str, value) -> None:
+    """保存单个运行参数到 data/settings.json。"""
+    save_settings({key: value})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -466,11 +527,11 @@ def apply_styles(root, scale):
         pass
 
     f = max(scale, 1.0)
-    font_base = (FONT_FAMILY, 10)
-    font_bold = (FONT_FAMILY, 10, "bold")
-    font_tab = (FONT_FAMILY, 11)
-    pad_x = int(round(14 * f))
-    pad_y = int(round(8 * f))
+    font_base = (FONT_FAMILY, 11)
+    font_bold = (FONT_FAMILY, 11, "bold")
+    font_tab = (FONT_FAMILY, 12)
+    pad_x = int(round(12 * f))
+    pad_y = int(round(6 * f))
 
     style.configure(".", font=font_base, background=COLOR_BG,
                     foreground=COLOR_TEXT)
@@ -486,10 +547,10 @@ def apply_styles(root, scale):
                     foreground=COLOR_TEXT_DIM)
     style.configure("Title.TLabel", background=COLOR_BG,
                     foreground=COLOR_PRIMARY,
-                    font=(FONT_FAMILY, 17, "bold"))
+                    font=(FONT_FAMILY, 18, "bold"))
     style.configure("Subtitle.TLabel", background=COLOR_BG,
                     foreground=COLOR_TEXT_DIM,
-                    font=(FONT_FAMILY, 10))
+                    font=(FONT_FAMILY, 11))
     style.configure("Section.TLabel", background=COLOR_CARD,
                     foreground=COLOR_PRIMARY, font=font_bold)
     style.configure("Pill.TLabel", background=COLOR_PRIMARY,
@@ -542,7 +603,7 @@ def apply_styles(root, scale):
 
     style.configure("Treeview", background=COLOR_CARD,
                     fieldbackground=COLOR_CARD, foreground=COLOR_TEXT,
-                    rowheight=int(round(28 * f)), font=font_base,
+                    rowheight=int(round(30 * f)), font=font_base,
                     borderwidth=0)
     style.configure("Treeview.Heading", background="#EEF2F5",
                     foreground=COLOR_PRIMARY, font=font_bold,
@@ -807,13 +868,14 @@ class PlotPanel(ttk.Frame):
 class ResultsPanel(ttk.Frame):
     """Tab 3: experiment record table on top, result plots for the selected run below."""
 
-    COLUMNS = ("run_id", "time", "src", "datano", "snr", "ber1", "ber2", "ber_avg")
+    COLUMNS = ("run_id", "time", "src", "datano", "snr", "rate", "ber1", "ber2", "ber_avg")
     HEADINGS = {
         "run_id": ("Experiment ID", 170),
         "time": ("Time", 150),
         "src": ("Source", 80),
         "datano": ("Symbols", 80),
         "snr": ("SNR (dB)", 80),
+        "rate": ("速率 Mbps", 90),
         "ber1": ("BER 带1", 110),
         "ber2": ("BER 带2", 110),
         "ber_avg": ("平均 BER", 110),
@@ -824,7 +886,7 @@ class ResultsPanel(ttk.Frame):
         self.app = app
 
         top = ttk.LabelFrame(self, text=" 传输实验记录（点击行切换实验） ")
-        top.pack(fill=tk.X, padx=2, pady=(2, 8))
+        top.pack(fill=tk.X, padx=2, pady=(2, 6))
         tree_frame = tk.Frame(top, bg=COLOR_CARD)
         tree_frame.pack(fill=tk.X, padx=6, pady=6)
         self.tree = ttk.Treeview(tree_frame, columns=self.COLUMNS,
@@ -839,7 +901,9 @@ class ResultsPanel(ttk.Frame):
         self.tree.configure(yscrollcommand=vsb.set)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.pack(fill=tk.X, expand=True)
-        self.tree.bind("<<TreeviewSelect>>", self._on_row_select)
+        ttk.Button(tree_frame, text="加载参数到运行测试",
+                   command=self._load_selected_to_run
+                   ).pack(anchor=tk.E, padx=0, pady=(4, 0))
 
         bottom = ttk.LabelFrame(self, text=" 当前实验结果 ")
         bottom.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
@@ -858,11 +922,13 @@ class ResultsPanel(ttk.Frame):
             ber1 = rec.get("ber_band1", np.nan)
             ber2 = rec.get("ber_band2", np.nan)
             ber_avg = rec.get("ber_avg", np.nan)
+            rate = rec.get("data_rate_mbps", 0)
             row = (
                 run_id, ts,
                 rec.get("data_source", ""),
                 rec.get("datano", ""),
                 f"{rec.get('snr_db', 0):.1f}",
+                f"{rate:.0f}" if rate else "N/A",
                 f"{ber1:.3e}" if ber1 is not None and not np.isnan(ber1) else "N/A",
                 f"{ber2:.3e}" if ber2 is not None and not np.isnan(ber2) else "N/A",
                 f"{ber_avg:.3e}" if ber_avg is not None and not np.isnan(ber_avg) else "N/A",
@@ -884,6 +950,35 @@ class ResultsPanel(ttk.Frame):
         if run_id and run_id != self.app.current_run:
             self.app.select_run(run_id, source="results")
 
+    def _load_selected_to_run(self):
+        """把选中实验的参数写回运行测试页，便于复现/重新下载 AWG 波形。"""
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("未选择", "请先在记录表中选中一行。")
+            return
+        run_id = self._iid_to_run.get(sel[0])
+        rec = _get_record(run_id)
+        if not rec:
+            return
+        run = self.app.panel_run
+        run.src_var.set(rec.get("data_source", cfg.DATA_SOURCE))
+        run.mod_var.set(rec.get("modulation_mode", cfg.MODULATION_MODE))
+        run.datano_var.set(int(rec.get("datano", cfg.DATANO)))
+        run.seed_var.set(int(rec.get("seed", cfg.SEED_BAND1)))
+        run.taps_var.set(int(rec.get("lms_taps", cfg.LMS_TAPS)))
+        run.mu1_var.set(float(rec.get("lms_mu1", cfg.LMS_MU1)))
+        run.mu2_var.set(float(rec.get("lms_mu2", cfg.LMS_MU2)))
+        run.ts_var.set(int(rec.get("numof_ts", cfg.NUMOF_TS)))
+        run.snr_var.set(float(rec.get("snr_db", cfg.SNR_DB)))
+        if rec.get("data_source") == "file":
+            run.rxfile_var.set(str(rec.get("rx_file", rec.get("rx_path", ""))))
+        if rec.get("osc_addr"):
+            run.oscaddr_var.set(rec["osc_addr"])
+        run._on_src_change()
+        run._save_all_parameters()
+        self.app.notebook.select(3)
+        self.app.status_var.set(f"已加载 {run_id} 的参数到运行测试页")
+
 
 class RunPanel(ttk.Frame):
     """Tab 4: run the superposed transceiver from the GUI with live log output."""
@@ -894,13 +989,48 @@ class RunPanel(ttk.Frame):
         self._queue = queue.Queue()
         self._thread: Optional[threading.Thread] = None
 
+        # 左右分栏：左侧可滚动（参数/AWG/优化卡片），右侧固定运行日志
+        left_frame = tk.Frame(self, bg=COLOR_BG)
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
+        right_frame = tk.Frame(self, bg=COLOR_BG)
+        right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
+
+        # 左侧滚动画布
+        left_canvas = tk.Canvas(left_frame, bg=COLOR_BG, highlightthickness=0)
+        left_scroll = ttk.Scrollbar(left_frame, orient=tk.VERTICAL,
+                                    command=left_canvas.yview)
+        left_canvas.configure(yscrollcommand=left_scroll.set)
+        left_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        left_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        scrollable_frame = tk.Frame(left_canvas, bg=COLOR_BG)
+        left_canvas.create_window((0, 0), window=scrollable_frame,
+                                  anchor=tk.NW, tags="frame")
+
+        def _on_left_configure(_event=None):
+            left_canvas.configure(scrollregion=left_canvas.bbox("all"))
+            # 让内部框架宽度随画布宽度变化
+            canvas_width = left_canvas.winfo_width()
+            left_canvas.itemconfig("frame", width=canvas_width)
+
+        scrollable_frame.bind("<Configure>", _on_left_configure)
+        left_canvas.bind("<Configure>", _on_left_configure)
+
+        def _on_left_mousewheel(event):
+            left_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        left_canvas.bind("<Enter>",
+                         lambda _e: left_canvas.bind_all("<MouseWheel>", _on_left_mousewheel))
+        left_canvas.bind("<Leave>",
+                         lambda _e: left_canvas.unbind_all("<MouseWheel>"))
+
         # ── Parameter card ───────────────────────────────────────────
-        opt = ttk.LabelFrame(self, text=" 实验参数 ")
-        opt.pack(fill=tk.X, padx=2, pady=(2, 8))
+        opt = ttk.LabelFrame(scrollable_frame, text=" 实验参数 ")
+        opt.pack(fill=tk.X, padx=2, pady=(2, 4))
 
         ttk.Label(opt, text="数据源:", style="Card.TLabel"
                   ).grid(row=0, column=0, sticky=tk.W, padx=12, pady=(10, 4))
-        self.src_var = tk.StringVar(value=cfg.DATA_SOURCE)
+        self.src_var = tk.StringVar(value=_setting_str("DATA_SOURCE", cfg.DATA_SOURCE))
         self.src_combo = ttk.Combobox(
             opt, textvariable=self.src_var,
             values=["virtual", "file", "scope"],
@@ -910,123 +1040,328 @@ class RunPanel(ttk.Frame):
 
         ttk.Label(opt, text="符号数:", style="Card.TLabel"
                   ).grid(row=0, column=2, sticky=tk.W, padx=12, pady=(10, 4))
-        self.datano_var = tk.IntVar(value=cfg.DATANO)
-        tk.Spinbox(opt, from_=1024, to=1024 * 512, increment=1024,
-                   textvariable=self.datano_var, width=16
-                   ).grid(row=0, column=3, sticky=tk.W, padx=(4, 16), pady=(10, 4))
+        self.datano_var = tk.IntVar(value=_setting_int("DATANO", cfg.DATANO))
+        self.datano_spin = tk.Spinbox(opt, from_=1024, to=1024 * 512, increment=1024,
+                                      textvariable=self.datano_var, width=16)
+        self.datano_spin.grid(row=0, column=3, sticky=tk.W, padx=(4, 16), pady=(10, 4))
+        self._bind_spinbox(self.datano_spin, self.datano_var, "DATANO", int)
 
         ttk.Label(opt, text="调制模式:", style="Card.TLabel"
                   ).grid(row=0, column=4, sticky=tk.W, padx=12, pady=(10, 4))
-        self.mod_var = tk.StringVar(value=cfg.MODULATION_MODE)
+        self.mod_var = tk.StringVar(value=_setting_str("MODULATION_MODE", cfg.MODULATION_MODE))
         self.mod_combo = ttk.Combobox(
             opt, textvariable=self.mod_var,
             values=core.SUPPORTED_MODULATIONS,
             state="readonly", width=16)
         self.mod_combo.grid(row=0, column=5, sticky=tk.W, padx=(4, 16), pady=(10, 4))
+        self.mod_combo.bind("<<ComboboxSelected>>", self._on_mod_change)
 
         ttk.Label(opt, text="信噪比 (dB):", style="Card.TLabel"
                   ).grid(row=1, column=0, sticky=tk.W, padx=12, pady=4)
-        self.snr_var = tk.DoubleVar(value=cfg.SNR_DB)
-        tk.Spinbox(opt, from_=0.0, to=50.0, increment=0.5,
-                   textvariable=self.snr_var, width=16
-                   ).grid(row=1, column=1, sticky=tk.W, padx=(4, 16), pady=4)
+        self.snr_var = tk.DoubleVar(value=_setting_float("SNR_DB", cfg.SNR_DB))
+        self.snr_spin = tk.Spinbox(opt, from_=0.0, to=50.0, increment=0.5,
+                                   textvariable=self.snr_var, width=16)
+        self.snr_spin.grid(row=1, column=1, sticky=tk.W, padx=(4, 16), pady=4)
+        self._bind_spinbox(self.snr_spin, self.snr_var, "SNR_DB", float)
 
         ttk.Label(opt, text="随机种子:", style="Card.TLabel"
                   ).grid(row=1, column=2, sticky=tk.W, padx=12, pady=4)
-        self.seed_var = tk.IntVar(value=cfg.SEED_BAND1)
-        tk.Spinbox(opt, from_=0, to=10000, textvariable=self.seed_var, width=16
-                   ).grid(row=1, column=3, sticky=tk.W, padx=(4, 16), pady=4)
+        self.seed_var = tk.IntVar(value=_setting_int("SEED", cfg.SEED_BAND1))
+        self.seed_spin = tk.Spinbox(opt, from_=0, to=10000, textvariable=self.seed_var, width=16)
+        self.seed_spin.grid(row=1, column=3, sticky=tk.W, padx=(4, 16), pady=4)
+        self._bind_spinbox(self.seed_spin, self.seed_var, "SEED", int)
 
         ttk.Label(opt, text="LMS 抽头数:", style="Card.TLabel"
                   ).grid(row=2, column=0, sticky=tk.W, padx=12, pady=4)
-        self.taps_var = tk.IntVar(value=cfg.LMS_TAPS)
-        tk.Spinbox(opt, from_=3, to=51, increment=2, textvariable=self.taps_var,
-                   width=16).grid(row=2, column=1, sticky=tk.W, padx=(4, 16), pady=4)
+        self.taps_var = tk.IntVar(value=_setting_int("LMS_TAPS", cfg.LMS_TAPS))
+        self.taps_spin = tk.Spinbox(opt, from_=3, to=51, increment=2,
+                                    textvariable=self.taps_var, width=16)
+        self.taps_spin.grid(row=2, column=1, sticky=tk.W, padx=(4, 16), pady=4)
+        self._bind_spinbox(self.taps_spin, self.taps_var, "LMS_TAPS", int)
 
         ttk.Label(opt, text="LMS 步长 μ1:", style="Card.TLabel"
                   ).grid(row=2, column=2, sticky=tk.W, padx=12, pady=4)
-        self.mu1_var = tk.DoubleVar(value=cfg.LMS_MU1)
-        tk.Spinbox(opt, from_=0.0001, to=1.0, increment=0.0005,
-                   textvariable=self.mu1_var, width=16
-                   ).grid(row=2, column=3, sticky=tk.W, padx=(4, 16), pady=4)
+        self.mu1_var = tk.DoubleVar(value=_setting_float("LMS_MU1", cfg.LMS_MU1))
+        self.mu1_spin = tk.Spinbox(opt, from_=0.0001, to=1.0, increment=0.0005,
+                                   textvariable=self.mu1_var, width=16)
+        self.mu1_spin.grid(row=2, column=3, sticky=tk.W, padx=(4, 16), pady=4)
+        self._bind_spinbox(self.mu1_spin, self.mu1_var, "LMS_MU1", float)
 
         ttk.Label(opt, text="LMS 步长 μ2:", style="Card.TLabel"
                   ).grid(row=3, column=0, sticky=tk.W, padx=12, pady=4)
-        self.mu2_var = tk.DoubleVar(value=cfg.LMS_MU2)
-        tk.Spinbox(opt, from_=0.0001, to=1.0, increment=0.0005,
-                   textvariable=self.mu2_var, width=16
-                   ).grid(row=3, column=1, sticky=tk.W, padx=(4, 16), pady=4)
+        self.mu2_var = tk.DoubleVar(value=_setting_float("LMS_MU2", cfg.LMS_MU2))
+        self.mu2_spin = tk.Spinbox(opt, from_=0.0001, to=1.0, increment=0.0005,
+                                   textvariable=self.mu2_var, width=16)
+        self.mu2_spin.grid(row=3, column=1, sticky=tk.W, padx=(4, 16), pady=4)
+        self._bind_spinbox(self.mu2_spin, self.mu2_var, "LMS_MU2", float)
 
         ttk.Label(opt, text="训练符号数:", style="Card.TLabel"
                   ).grid(row=3, column=2, sticky=tk.W, padx=12, pady=4)
-        self.ts_var = tk.IntVar(value=cfg.NUMOF_TS)
-        tk.Spinbox(opt, from_=100, to=20000, increment=100,
-                   textvariable=self.ts_var, width=16
-                   ).grid(row=3, column=3, sticky=tk.W, padx=(4, 16), pady=4)
+        self.ts_var = tk.IntVar(value=_setting_int("NUMOF_TS", cfg.NUMOF_TS))
+        self.ts_spin = tk.Spinbox(opt, from_=100, to=20000, increment=100,
+                                  textvariable=self.ts_var, width=16)
+        self.ts_spin.grid(row=3, column=3, sticky=tk.W, padx=(4, 16), pady=4)
+        self._bind_spinbox(self.ts_spin, self.ts_var, "NUMOF_TS", int)
 
-        ttk.Label(opt, text="接收文件:", style="Card.TLabel"
+        ttk.Label(opt, text="接收波形 (rx_*.txt):", style="Card.TLabel"
                   ).grid(row=4, column=0, sticky=tk.W, padx=12, pady=4)
-        self.rxfile_var = tk.StringVar(value="")
-        self.rxfile_entry = ttk.Entry(opt, textvariable=self.rxfile_var, width=16)
+        self.rxfile_var = tk.StringVar(value=_setting_str("RX_FILE", ""))
+        self.rxfile_entry = ttk.Entry(opt, textvariable=self.rxfile_var, width=20)
         self.rxfile_entry.grid(row=4, column=1, sticky=tk.W, padx=(4, 4), pady=4)
+        self._bind_entry(self.rxfile_entry, self.rxfile_var, "RX_FILE")
         self.rxfile_btn = ttk.Button(opt, text="浏览…", command=self._browse_rx)
         self.rxfile_btn.grid(row=4, column=2, sticky=tk.W, padx=(0, 16), pady=4)
 
         ttk.Label(opt, text="示波器地址:", style="Card.TLabel"
                   ).grid(row=5, column=0, sticky=tk.W, padx=12, pady=4)
-        self.oscaddr_var = tk.StringVar(value=cfg.OSC_VISA_ADDR)
+        self.oscaddr_var = tk.StringVar(value=_setting_str("OSC_VISA_ADDR", cfg.OSC_VISA_ADDR))
         self.oscaddr_entry = ttk.Entry(opt, textvariable=self.oscaddr_var, width=24)
         self.oscaddr_entry.grid(row=5, column=1, sticky=tk.W, padx=(4, 4), pady=4)
+        self._bind_entry(self.oscaddr_entry, self.oscaddr_var, "OSC_VISA_ADDR",
+                         on_save=lambda v: _persist_addresses(osc_addr=v))
         ttk.Button(opt, text="自动识别", command=self._auto_detect_scope
-                   ).grid(row=5, column=2, sticky=tk.W, padx=(0, 16), pady=4)
+                   ).grid(row=5, column=2, sticky=tk.W, padx=(0, 4), pady=4)
+
+        ttk.Label(opt, text="示波器通道:", style="Card.TLabel"
+                  ).grid(row=5, column=3, sticky=tk.W, padx=12, pady=4)
+        self.oscchan_var = tk.StringVar(value=_setting_str("OSC_CHANNEL", cfg.OSC_CHANNEL))
+        self.oscchan_combo = ttk.Combobox(
+            opt, textvariable=self.oscchan_var,
+            values=["CHAN1", "CHAN2", "CHAN3", "CHAN4"],
+            state="readonly", width=10)
+        self.oscchan_combo.grid(row=5, column=4, sticky=tk.W, padx=(4, 4), pady=4)
+        self.oscchan_combo.bind("<<ComboboxSelected>>",
+                                lambda _e: _persist_addresses(osc_channel=self.oscchan_var.get()))
+
+        self.oscdual_var = tk.BooleanVar(value=_setting_bool("OSC_DUAL", False))
+        self.oscdual_check = ttk.Checkbutton(
+            opt, text="双通道采集 (CH1+CH2)", variable=self.oscdual_var,
+            command=self._on_oscdual_change)
+        self.oscdual_check.grid(row=5, column=5, sticky=tk.W, padx=(4, 16), pady=4)
+
+        ttk.Label(opt, text="示波器采样率 (MSa/s):", style="Card.TLabel"
+                  ).grid(row=6, column=0, sticky=tk.W, padx=12, pady=4)
+        self.oscsrate_var = tk.DoubleVar(value=_setting_float("OSC_SAMPLE", cfg.OSC_SAMPLE))
+        self.oscsrate_spin = tk.Spinbox(opt, from_=100, to=10000, increment=100,
+                                        textvariable=self.oscsrate_var, width=16)
+        self.oscsrate_spin.grid(row=6, column=1, sticky=tk.W, padx=(4, 16), pady=4)
+        self._bind_spinbox(self.oscsrate_spin, self.oscsrate_var, "OSC_SAMPLE", float)
 
         btn_bar = tk.Frame(opt, bg=COLOR_CARD)
-        btn_bar.grid(row=6, column=0, columnspan=6, sticky=tk.W,
+        btn_bar.grid(row=7, column=0, columnspan=6, sticky=tk.W,
                      padx=12, pady=(4, 8))
         self.run_btn = ttk.Button(btn_bar, text="▶  运行仿真",
                                   style="Accent.TButton",
                                   command=self.start_run)
         self.run_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self.save_params_btn = ttk.Button(btn_bar, text="💾 保存参数",
+                                          command=self._save_all_parameters)
+        self.save_params_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.quick_btn = ttk.Button(btn_bar, text="⚡ 快速绘图（仅发射）",
                                     command=self._quick_plot)
         self.quick_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.run_status = ttk.Label(btn_bar, text="就绪", style="DimCard.TLabel")
         self.run_status.pack(side=tk.LEFT, padx=16)
 
-        # ── AWG card ─────────────────────────────────────────────────
-        awg_card = ttk.LabelFrame(self, text=" AWG520 波形下载（CH1 = I 路，CH2 = Q 路） ")
-        awg_card.pack(fill=tk.X, padx=2, pady=(2, 8))
+        # ── AWG520 card ──────────────────────────────────────────────
+        awg_card = ttk.LabelFrame(scrollable_frame, text=" AWG520 波形下载 ")
+        awg_card.pack(fill=tk.X, padx=2, pady=(2, 4))
 
         ttk.Label(awg_card, text="AWG 地址:", style="Card.TLabel"
                   ).grid(row=0, column=0, sticky=tk.W, padx=12, pady=(8, 4))
-        self.awgaddr_var = tk.StringVar(value=cfg.AWG_VISA_ADDR)
-        ttk.Entry(awg_card, textvariable=self.awgaddr_var, width=36
-                  ).grid(row=0, column=1, sticky=tk.W, padx=(4, 4), pady=(8, 4))
+        self.awgaddr_var = tk.StringVar(value=_setting_str("AWG_VISA_ADDR", cfg.AWG_VISA_ADDR))
+        self.awgaddr_entry = ttk.Entry(awg_card, textvariable=self.awgaddr_var, width=36)
+        self.awgaddr_entry.grid(row=0, column=1, sticky=tk.W, padx=(4, 4), pady=(8, 4))
+        self._bind_entry(self.awgaddr_entry, self.awgaddr_var, "AWG_VISA_ADDR",
+                         on_save=lambda v: _persist_addresses(awg_addr=v))
         ttk.Button(awg_card, text="自动识别", command=self._auto_detect_awg
                    ).grid(row=0, column=2, sticky=tk.W, padx=(0, 16), pady=(8, 4))
 
-        ttk.Label(awg_card, text="幅度 Vpp:", style="Card.TLabel"
+        ttk.Label(awg_card, text="采样率 (MSa/s):", style="Card.TLabel"
                   ).grid(row=1, column=0, sticky=tk.W, padx=12, pady=(4, 8))
-        self.awgvpp_var = tk.DoubleVar(value=cfg.AWG_VPP)
-        tk.Spinbox(awg_card, from_=0.02, to=2.0, increment=0.05,
-                   textvariable=self.awgvpp_var, width=8
-                   ).grid(row=1, column=1, sticky=tk.W, padx=(4, 16), pady=(4, 8))
+        self.awgsrate_var = tk.DoubleVar(value=_setting_float("AWG_SAMPLE_RATE", cfg.AWG_SAMPLE))
+        self.awgsrate_spin = tk.Spinbox(awg_card, from_=10, to=2000, increment=10,
+                                        textvariable=self.awgsrate_var, width=8)
+        self.awgsrate_spin.grid(row=1, column=1, sticky=tk.W, padx=(4, 16), pady=(4, 8))
+        self._bind_spinbox(self.awgsrate_spin, self.awgsrate_var, "AWG_SAMPLE_RATE", float)
+
+        ttk.Label(awg_card, text="CH1 幅度 Vpp:", style="Card.TLabel"
+                  ).grid(row=1, column=2, sticky=tk.W, padx=12, pady=(4, 8))
+        self.awgvpp_ch1_var = tk.DoubleVar(value=_setting_float("AWG_VPP_CH1", cfg.AWG_VPP_CH1))
+        self.awgvpp_ch1_spin = tk.Spinbox(awg_card, from_=0.02, to=2.0, increment=0.05,
+                                          textvariable=self.awgvpp_ch1_var, width=8)
+        self.awgvpp_ch1_spin.grid(row=1, column=3, sticky=tk.W, padx=(4, 16), pady=(4, 8))
+        self._bind_spinbox(self.awgvpp_ch1_spin, self.awgvpp_ch1_var, "AWG_VPP_CH1", float)
+
+        self.awg_apply_btn = ttk.Button(awg_card, text="⚙ 应用输出设置",
+                                        command=self._apply_awg_output_settings)
+        self.awg_apply_btn.grid(row=1, column=4, sticky=tk.W, padx=(8, 4), pady=(4, 8))
+
+        self.awg_combine_var = tk.BooleanVar(value=_setting_bool("AWG_COMBINE", False))
+        self.awg_combine_check = ttk.Checkbutton(
+            awg_card, text="叠加到单通道 (CH1)", variable=self.awg_combine_var,
+            command=self._on_awg_combine_change)
+        self.awg_combine_check.grid(row=1, column=5, sticky=tk.W, padx=(4, 16), pady=(4, 8))
+
+        ttk.Label(awg_card, text="CH2 幅度 Vpp:", style="Card.TLabel"
+                  ).grid(row=2, column=2, sticky=tk.W, padx=12, pady=(4, 8))
+        self.awgvpp_ch2_var = tk.DoubleVar(value=_setting_float("AWG_VPP_CH2", cfg.AWG_VPP_CH2))
+        self.awgvpp_ch2_spin = tk.Spinbox(awg_card, from_=0.02, to=2.0, increment=0.05,
+                                          textvariable=self.awgvpp_ch2_var, width=8)
+        self.awgvpp_ch2_spin.grid(row=2, column=3, sticky=tk.W, padx=(4, 16), pady=(4, 8))
+        self._bind_spinbox(self.awgvpp_ch2_spin, self.awgvpp_ch2_var, "AWG_VPP_CH2", float)
 
         self.awg_dl_btn = ttk.Button(awg_card, text="⬇ 生成并下载双通道波形",
                                      style="Accent.TButton",
                                      command=self._start_awg_download)
-        self.awg_dl_btn.grid(row=1, column=2, sticky=tk.W, padx=(8, 4), pady=(4, 8))
+        self.awg_dl_btn.grid(row=2, column=4, sticky=tk.W, padx=(8, 4), pady=(4, 8))
+        self.awg_start_btn = ttk.Button(awg_card, text="▶ 开始输出",
+                                        command=self._start_awg_output)
+        self.awg_start_btn.grid(row=2, column=5, sticky=tk.W, padx=(4, 12), pady=(4, 8))
+
+        self.awg_sync_var = tk.StringVar(value="请下载 AWG 波形")
+        self.awg_sync_label = ttk.Label(
+            awg_card, textvariable=self.awg_sync_var,
+            style="DimCard.TLabel")
+        self.awg_sync_label.grid(row=3, column=0, columnspan=4,
+                                 sticky=tk.W, padx=12, pady=(4, 8))
         self.awg_stop_btn = ttk.Button(awg_card, text="停止输出",
                                        command=self._stop_awg)
-        self.awg_stop_btn.grid(row=1, column=3, sticky=tk.W, padx=(4, 12), pady=(4, 8))
+        self.awg_stop_btn.grid(row=3, column=4, sticky=tk.W, padx=(8, 4), pady=(4, 8))
+        self.awg_clear_btn = ttk.Button(awg_card, text="🗑 清空 AWG",
+                                        command=self._clear_awg)
+        self.awg_clear_btn.grid(row=3, column=5, sticky=tk.W, padx=(4, 12), pady=(4, 8))
 
-        # ── Bottom: log card ─────────────────────────────────────────
-        log_card = ttk.LabelFrame(self, text=" 运行日志 ")
+        self.awg_gen_only_btn = ttk.Button(
+            awg_card, text="⧉ 仅生成波形",
+            command=self._generate_awg_waveform_only)
+        self.awg_gen_only_btn.grid(row=4, column=4, sticky=tk.W,
+                                   padx=(8, 4), pady=(4, 8))
+
+        self.awg_card = awg_card
+        self._on_awg_combine_change()
+        # 初始状态尚未下载，提示用户先下载；后续变更再由对应回调更新
+        self.awg_sync_var.set("请下载 AWG 波形")
+
+        # ── LMS 离线参数优化 card ─────────────────────────────────────
+        sweep_card = ttk.LabelFrame(scrollable_frame, text=" 离线 LMS 参数优化（仅 file 数据源） ")
+        sweep_card.pack(fill=tk.X, padx=2, pady=(2, 4))
+
+        self.sweep_enabled_var = tk.BooleanVar(
+            value=_setting_bool("SWEEP_ENABLED", True))
+        self.sweep_enabled_check = ttk.Checkbutton(
+            sweep_card, text="启用 LMS 参数扫参", variable=self.sweep_enabled_var,
+            command=self._on_sweep_enable_change)
+        self.sweep_enabled_check.pack(anchor=tk.W, padx=12, pady=(8, 4))
+
+        # taps
+        taps_frame = tk.Frame(sweep_card, bg=COLOR_CARD)
+        taps_frame.pack(fill=tk.X, padx=12, pady=2)
+        ttk.Label(taps_frame, text="抽头数 最小:", style="Card.TLabel"
+                  ).pack(side=tk.LEFT)
+        self.sweep_taps_min_var = tk.IntVar(value=_setting_int("SWEEP_TAPS_MIN", 3))
+        self.sweep_taps_min_spin = tk.Spinbox(
+            taps_frame, from_=1, to=51, increment=2,
+            textvariable=self.sweep_taps_min_var, width=6)
+        self.sweep_taps_min_spin.pack(side=tk.LEFT, padx=(4, 12))
+        self._bind_spinbox(self.sweep_taps_min_spin, self.sweep_taps_min_var,
+                           "SWEEP_TAPS_MIN", int)
+        ttk.Label(taps_frame, text="最大:", style="Card.TLabel"
+                  ).pack(side=tk.LEFT)
+        self.sweep_taps_max_var = tk.IntVar(value=_setting_int("SWEEP_TAPS_MAX", 31))
+        self.sweep_taps_max_spin = tk.Spinbox(
+            taps_frame, from_=1, to=51, increment=2,
+            textvariable=self.sweep_taps_max_var, width=6)
+        self.sweep_taps_max_spin.pack(side=tk.LEFT, padx=(4, 12))
+        self._bind_spinbox(self.sweep_taps_max_spin, self.sweep_taps_max_var,
+                           "SWEEP_TAPS_MAX", int)
+        ttk.Label(taps_frame, text="步进:", style="Card.TLabel"
+                  ).pack(side=tk.LEFT)
+        self.sweep_taps_step_var = tk.IntVar(value=_setting_int("SWEEP_TAPS_STEP", 4))
+        self.sweep_taps_step_spin = tk.Spinbox(
+            taps_frame, from_=2, to=10, increment=2,
+            textvariable=self.sweep_taps_step_var, width=6)
+        self.sweep_taps_step_spin.pack(side=tk.LEFT, padx=(4, 12))
+        self._bind_spinbox(self.sweep_taps_step_spin, self.sweep_taps_step_var,
+                           "SWEEP_TAPS_STEP", int)
+
+        # mu1
+        mu1_frame = tk.Frame(sweep_card, bg=COLOR_CARD)
+        mu1_frame.pack(fill=tk.X, padx=12, pady=2)
+        ttk.Label(mu1_frame, text="μ1 范围:", style="Card.TLabel"
+                  ).pack(side=tk.LEFT)
+        self.sweep_mu1_min_var = tk.DoubleVar(value=_setting_float("SWEEP_MU1_MIN", 1e-3))
+        self.sweep_mu1_min_entry = ttk.Entry(mu1_frame, textvariable=self.sweep_mu1_min_var, width=10)
+        self.sweep_mu1_min_entry.pack(side=tk.LEFT, padx=(4, 4))
+        self._bind_entry(self.sweep_mu1_min_entry, self.sweep_mu1_min_var, "SWEEP_MU1_MIN")
+        ttk.Label(mu1_frame, text="~", style="Card.TLabel").pack(side=tk.LEFT)
+        self.sweep_mu1_max_var = tk.DoubleVar(value=_setting_float("SWEEP_MU1_MAX", 1e-1))
+        self.sweep_mu1_max_entry = ttk.Entry(mu1_frame, textvariable=self.sweep_mu1_max_var, width=10)
+        self.sweep_mu1_max_entry.pack(side=tk.LEFT, padx=(4, 12))
+        self._bind_entry(self.sweep_mu1_max_entry, self.sweep_mu1_max_var, "SWEEP_MU1_MAX")
+        ttk.Label(mu1_frame, text="点数:", style="Card.TLabel").pack(side=tk.LEFT)
+        self.sweep_mu1_points_var = tk.IntVar(value=_setting_int("SWEEP_MU1_POINTS", 5))
+        self.sweep_mu1_points_spin = tk.Spinbox(
+            mu1_frame, from_=2, to=20, textvariable=self.sweep_mu1_points_var, width=5)
+        self.sweep_mu1_points_spin.pack(side=tk.LEFT, padx=(4, 12))
+        self._bind_spinbox(self.sweep_mu1_points_spin, self.sweep_mu1_points_var,
+                           "SWEEP_MU1_POINTS", int)
+
+        # mu2
+        mu2_frame = tk.Frame(sweep_card, bg=COLOR_CARD)
+        mu2_frame.pack(fill=tk.X, padx=12, pady=2)
+        ttk.Label(mu2_frame, text="μ2 范围:", style="Card.TLabel"
+                  ).pack(side=tk.LEFT)
+        self.sweep_mu2_min_var = tk.DoubleVar(value=_setting_float("SWEEP_MU2_MIN", 1e-3))
+        self.sweep_mu2_min_entry = ttk.Entry(mu2_frame, textvariable=self.sweep_mu2_min_var, width=10)
+        self.sweep_mu2_min_entry.pack(side=tk.LEFT, padx=(4, 4))
+        self._bind_entry(self.sweep_mu2_min_entry, self.sweep_mu2_min_var, "SWEEP_MU2_MIN")
+        ttk.Label(mu2_frame, text="~", style="Card.TLabel").pack(side=tk.LEFT)
+        self.sweep_mu2_max_var = tk.DoubleVar(value=_setting_float("SWEEP_MU2_MAX", 1e-1))
+        self.sweep_mu2_max_entry = ttk.Entry(mu2_frame, textvariable=self.sweep_mu2_max_var, width=10)
+        self.sweep_mu2_max_entry.pack(side=tk.LEFT, padx=(4, 12))
+        self._bind_entry(self.sweep_mu2_max_entry, self.sweep_mu2_max_var, "SWEEP_MU2_MAX")
+        ttk.Label(mu2_frame, text="点数:", style="Card.TLabel").pack(side=tk.LEFT)
+        self.sweep_mu2_points_var = tk.IntVar(value=_setting_int("SWEEP_MU2_POINTS", 5))
+        self.sweep_mu2_points_spin = tk.Spinbox(
+            mu2_frame, from_=2, to=20, textvariable=self.sweep_mu2_points_var, width=5)
+        self.sweep_mu2_points_spin.pack(side=tk.LEFT, padx=(4, 12))
+        self._bind_spinbox(self.sweep_mu2_points_spin, self.sweep_mu2_points_var,
+                           "SWEEP_MU2_POINTS", int)
+
+        # scale + buttons
+        btn_frame = tk.Frame(sweep_card, bg=COLOR_CARD)
+        btn_frame.pack(fill=tk.X, padx=12, pady=(4, 8))
+        ttk.Label(btn_frame, text="步长尺度:", style="Card.TLabel"
+                  ).pack(side=tk.LEFT)
+        self.sweep_mu_scale_var = tk.StringVar(value=_setting_str("SWEEP_MU_SCALE", "log"))
+        self.sweep_mu_scale_combo = ttk.Combobox(
+            btn_frame, textvariable=self.sweep_mu_scale_var,
+            values=["log", "linear"], state="readonly", width=8)
+        self.sweep_mu_scale_combo.pack(side=tk.LEFT, padx=(4, 16))
+        self.sweep_mu_scale_combo.bind("<<ComboboxSelected>>",
+                                       lambda _e: _persist_setting("SWEEP_MU_SCALE",
+                                                                   self.sweep_mu_scale_var.get()))
+
+        self.sweep_btn = ttk.Button(btn_frame, text="▶ 离线优化",
+                                    style="Accent.TButton",
+                                    command=self._start_sweep)
+        self.sweep_btn.pack(side=tk.LEFT, padx=(0, 12))
+        self.sweep_status_var = tk.StringVar(value="扫参未启用")
+        self.sweep_status_label = ttk.Label(
+            btn_frame, textvariable=self.sweep_status_var, style="DimCard.TLabel")
+        self.sweep_status_label.pack(side=tk.LEFT)
+
+        self.sweep_card = sweep_card
+        self._update_sweep_state()
+
+        # ── Right-side: log card ─────────────────────────────────────
+        log_card = ttk.LabelFrame(right_frame, text=" 运行日志 ")
         log_card.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
         log_frame = tk.Frame(log_card, bg=COLOR_CARD)
         log_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         self.log_text = tk.Text(
-            log_frame, wrap=tk.NONE, state=tk.DISABLED, width=40,
+            log_frame, wrap=tk.NONE, state=tk.DISABLED, width=60,
             font=(FONT_MONO, 9),
             bg="#0F172A", fg="#E2E8F0", bd=0, highlightthickness=0,
             insertbackground="#E2E8F0")
@@ -1039,26 +1374,73 @@ class RunPanel(ttk.Frame):
         self.log_text.tag_configure("err", foreground="#F87171")
 
         self._append_log(
-            "提示：选择数据源与参数后点击“运行仿真”。\n"
-            "virtual = 虚拟信道离线仿真；file = 读取已保存接收波形；scope = 在线采集示波器。\n"
+            "提示：选择数据源与参数后点击对应按钮。\n"
+            "virtual = 虚拟信道离线仿真；file = 读取已保存接收波形；scope = 在线采集示波器并运行。\n"
             "运行完成后会自动刷新并切换到最新实验。\n", "head")
 
         self._on_src_change()
 
     def _on_src_change(self, _event=None):
         src = self.src_var.get()
+        _persist_setting("DATA_SOURCE", src)
         file_state = tk.NORMAL if src == "file" else tk.DISABLED
         scope_state = tk.NORMAL if src == "scope" else tk.DISABLED
         self.rxfile_entry.configure(state=file_state)
         self.rxfile_btn.configure(state=file_state)
         self.oscaddr_entry.configure(state=scope_state)
+        self.oscdual_check.configure(state=scope_state)
+        # SNR 输入仅在 virtual 仿真时有效；file/scope 使用均衡后估计的实际 SNR
+        self.snr_spin.configure(state=tk.NORMAL if src == "virtual" else tk.DISABLED)
+        self._update_oscchan_state()
+        if src == "scope":
+            self.run_btn.configure(text="▶  采集并运行")
+        elif src == "file":
+            self.run_btn.configure(text="▶  从文件运行")
+        else:
+            self.run_btn.configure(text="▶  运行仿真")
+        self._update_sweep_state()
+
+    def _update_oscchan_state(self):
+        """双通道采集开启时禁用单通道下拉框。"""
+        src = self.src_var.get()
+        if src != "scope" or self.oscdual_var.get():
+            self.oscchan_combo.configure(state=tk.DISABLED)
+        else:
+            self.oscchan_combo.configure(state="readonly")
+
+    def _on_oscdual_change(self):
+        self._update_oscchan_state()
+        _persist_addresses(osc_dual=self.oscdual_var.get())
 
     def _browse_rx(self):
         path = filedialog.askopenfilename(
+            title="选择原始接收波形文件",
             initialdir=str(cfg.RXDATA_DIR),
-            filetypes=[("Text 波形", "*.txt"), ("所有文件", "*.*")])
+            filetypes=[("原始接收波形 rx_*.txt", "*.txt"), ("所有文件", "*.*")])
         if path:
             self.rxfile_var.set(path)
+            _persist_setting("RX_FILE", path)
+
+    def _bind_spinbox(self, widget, var, key: str, converter):
+        """监听 Spinbox 变量变化，变更即保存（覆盖手动输入、增减箭头等）。"""
+        def _save(*_args):
+            try:
+                value = converter(var.get())
+                _persist_setting(key, value)
+            except Exception:
+                pass
+        var.trace_add("write", _save)
+
+    def _bind_entry(self, widget, var, key: str, on_save=None):
+        """给 Entry 绑定失焦 / 回车事件，变更即保存。"""
+        def _save(_event=None):
+            value = var.get()
+            if on_save is not None:
+                on_save(value)
+            else:
+                _persist_setting(key, value)
+        widget.bind("<FocusOut>", _save)
+        widget.bind("<Return>", _save)
 
     def _show_instruments_dialog(self, title: str, instruments):
         """弹出窗口显示识别到的仪器列表。"""
@@ -1083,7 +1465,8 @@ class RunPanel(ttk.Frame):
 
     def _auto_detect_scope_thread(self):
         try:
-            candidates = instr_disc.detect_scope_candidates()
+            extra = [self.oscaddr_var.get().strip()]
+            candidates = instr_disc.detect_scope_candidates(extra_addrs=extra)
             if not candidates:
                 self._queue.put(("log", "未识别到示波器，请检查连接与驱动。"))
                 self._queue.put(("info", "未找到示波器。"))
@@ -1103,7 +1486,8 @@ class RunPanel(ttk.Frame):
 
     def _auto_detect_awg_thread(self):
         try:
-            candidates = instr_disc.detect_awg_candidates()
+            extra = [self.awgaddr_var.get().strip()]
+            candidates = instr_disc.detect_awg_candidates(extra_addrs=extra)
             if not candidates:
                 self._queue.put(("log", "未识别到 AWG，请检查连接与驱动。"))
                 self._queue.put(("info", "未找到 AWG。"))
@@ -1116,12 +1500,29 @@ class RunPanel(ttk.Frame):
             self._queue.put(("log", f"自动识别失败: {exc}"))
             self._queue.put(("error", f"自动识别失败: {exc}"))
 
+    def _on_awg_combine_change(self):
+        """切换单通道叠加模式时更新界面状态并保存。"""
+        combine = self.awg_combine_var.get()
+        _persist_setting("AWG_COMBINE", combine)
+        self._mark_awg_out_of_sync("叠加方式已更改，请重新下载 AWG 波形")
+        if combine:
+            self.awg_card.configure(text=" AWG520 波形下载（两路叠加到 CH1） ")
+            self.awg_dl_btn.configure(text="⬇ 生成并下载单通道叠加波形")
+            self.awgvpp_ch2_spin.configure(state=tk.DISABLED)
+        else:
+            self.awg_card.configure(text=" AWG520 波形下载（CH1 = I 路，CH2 = Q 路） ")
+            self.awg_dl_btn.configure(text="⬇ 生成并下载双通道波形")
+            self.awgvpp_ch2_spin.configure(state=tk.NORMAL)
+
     def _start_awg_download(self):
         if self._thread is not None and self._thread.is_alive():
             messagebox.showinfo("忙", "已有任务在运行，请等待完成。")
             return
         self.awg_dl_btn.configure(state=tk.DISABLED)
-        self._append_log("\n===== 开始生成并下载 AWG 双通道波形 =====\n", "head")
+        if self.awg_combine_var.get():
+            self._append_log("\n===== 开始生成并下载 AWG 单通道叠加波形 =====\n", "head")
+        else:
+            self._append_log("\n===== 开始生成并下载 AWG 双通道波形 =====\n", "head")
         self._thread = threading.Thread(target=self._awg_thread, daemon=True)
         self._thread.start()
         self.after(100, self._poll)
@@ -1135,16 +1536,190 @@ class RunPanel(ttk.Frame):
             tx = core.generate_tx(v1, v2)
             self._queue.put(("log",
                              f"发射波形已生成: 调制={mode}, 符号数={datano}, 种子={seed}, "
-                             f"采样率={cfg.AWG_SAMPLE} MSa/s"))
-            awg_m8190a.download_two_channels(
-                tx["data1"], tx["data2"],
-                vpp=self.awgvpp_var.get(),
-                visa_addr=self.awgaddr_var.get().strip(),
-                log=lambda msg: self._queue.put(("log", msg)),
-            )
+                             f"采样率={self.awgsrate_var.get()} MSa/s"))
+            if self.awg_combine_var.get():
+                awg_m8190a.combine_and_download_single_channel(
+                    tx["data1"], tx["data2"],
+                    sample_rate=self.awgsrate_var.get() * 1e6,
+                    vpp=self.awgvpp_ch1_var.get(),
+                    channel=1,
+                    visa_addr=self.awgaddr_var.get().strip(),
+                    log=lambda msg: self._queue.put(("log", msg)),
+                )
+            else:
+                awg_m8190a.download_two_channels(
+                    tx["data1"], tx["data2"],
+                    sample_rate=self.awgsrate_var.get() * 1e6,
+                    vpp_ch1=self.awgvpp_ch1_var.get(),
+                    vpp_ch2=self.awgvpp_ch2_var.get(),
+                    visa_addr=self.awgaddr_var.get().strip(),
+                    log=lambda msg: self._queue.put(("log", msg)),
+                )
             self._queue.put(("awg_done", None))
         except Exception as exc:
             self._queue.put(("awg_error", exc))
+
+    def _mark_awg_out_of_sync(self, reason: str = "请重新下载 AWG 波形"):
+        """当发射参数变更时提示用户当前 AWG 波形可能已不同步。"""
+        self.awg_sync_var.set(f"⚠ {reason}")
+
+    def _mark_awg_synced(self):
+        """下载完成后标记 AWG 波形与当前设置同步。"""
+        self.awg_sync_var.set("✓ 波形已与当前设置同步")
+
+    def _on_mod_change(self, _event=None):
+        """调制模式变更时保存并提示重新下载。"""
+        _persist_setting("MODULATION_MODE", self.mod_var.get())
+        self._mark_awg_out_of_sync("调制模式已更改，请重新下载 AWG 波形")
+
+    def _save_all_parameters(self):
+        """把当前运行测试页所有参数显式保存到 settings.json。"""
+        save_settings({
+            "DATA_SOURCE": self.src_var.get(),
+            "DATANO": self.datano_var.get(),
+            "MODULATION_MODE": self.mod_var.get(),
+            "SNR_DB": self.snr_var.get(),
+            "SEED": self.seed_var.get(),
+            "LMS_TAPS": self.taps_var.get(),
+            "LMS_MU1": self.mu1_var.get(),
+            "LMS_MU2": self.mu2_var.get(),
+            "NUMOF_TS": self.ts_var.get(),
+            "RX_FILE": self.rxfile_var.get(),
+            "OSC_VISA_ADDR": self.oscaddr_var.get(),
+            "OSC_CHANNEL": self.oscchan_var.get(),
+            "OSC_DUAL": self.oscdual_var.get(),
+            "OSC_SAMPLE": self.oscsrate_var.get(),
+            "AWG_VISA_ADDR": self.awgaddr_var.get(),
+            "AWG_SAMPLE_RATE": self.awgsrate_var.get(),
+            "AWG_VPP_CH1": self.awgvpp_ch1_var.get(),
+            "AWG_VPP_CH2": self.awgvpp_ch2_var.get(),
+            "AWG_COMBINE": self.awg_combine_var.get(),
+            "SWEEP_ENABLED": self.sweep_enabled_var.get(),
+            "SWEEP_TAPS_MIN": self.sweep_taps_min_var.get(),
+            "SWEEP_TAPS_MAX": self.sweep_taps_max_var.get(),
+            "SWEEP_TAPS_STEP": self.sweep_taps_step_var.get(),
+            "SWEEP_MU1_MIN": self.sweep_mu1_min_var.get(),
+            "SWEEP_MU1_MAX": self.sweep_mu1_max_var.get(),
+            "SWEEP_MU1_POINTS": self.sweep_mu1_points_var.get(),
+            "SWEEP_MU2_MIN": self.sweep_mu2_min_var.get(),
+            "SWEEP_MU2_MAX": self.sweep_mu2_max_var.get(),
+            "SWEEP_MU2_POINTS": self.sweep_mu2_points_var.get(),
+            "SWEEP_MU_SCALE": self.sweep_mu_scale_var.get(),
+        })
+        self._append_log("\n===== 当前运行参数已保存 =====\n", "head")
+
+    def _on_sweep_enable_change(self):
+        """启用/禁用扫参时更新状态并保存。"""
+        _persist_setting("SWEEP_ENABLED", self.sweep_enabled_var.get())
+        self._update_sweep_state()
+
+    def _update_sweep_state(self):
+        """根据数据源和是否启用扫参更新按钮与提示。"""
+        enabled = self.sweep_enabled_var.get()
+        src_ok = self.src_var.get() == "file"
+        if not enabled:
+            self.sweep_btn.configure(state=tk.DISABLED)
+            self.sweep_status_var.set("扫参未启用")
+        elif not src_ok:
+            self.sweep_btn.configure(state=tk.DISABLED)
+            self.sweep_status_var.set("仅数据源为 file 时可用")
+        else:
+            self.sweep_btn.configure(state=tk.NORMAL)
+            self.sweep_status_var.set("就绪")
+
+    def _start_sweep(self):
+        """启动离线 LMS 参数扫描线程。"""
+        if self._thread is not None and self._thread.is_alive():
+            messagebox.showinfo("忙", "已有任务在运行，请等待完成。")
+            return
+        if self.src_var.get() != "file":
+            messagebox.showwarning("数据源错误", "离线参数优化仅支持 file 数据源。")
+            return
+        rx_file = self.rxfile_var.get().strip()
+        if not rx_file:
+            messagebox.showwarning("缺少接收文件", "请在“接收波形”中选择 rx_*.txt 文件。")
+            return
+        if not Path(rx_file).is_file():
+            messagebox.showerror("文件不存在", f"找不到接收文件:\n{rx_file}")
+            return
+
+        taps_min = self.sweep_taps_min_var.get()
+        taps_max = self.sweep_taps_max_var.get()
+        taps_step = self.sweep_taps_step_var.get()
+        if taps_min > taps_max or taps_step <= 0:
+            messagebox.showwarning("参数错误", "抽头数范围设置不正确。")
+            return
+
+        try:
+            mu1_min = float(self.sweep_mu1_min_var.get())
+            mu1_max = float(self.sweep_mu1_max_var.get())
+            mu2_min = float(self.sweep_mu2_min_var.get())
+            mu2_max = float(self.sweep_mu2_max_var.get())
+        except Exception:
+            messagebox.showwarning("参数错误", "μ1 / μ2 范围请输入有效数字。")
+            return
+        if mu1_min <= 0 or mu1_max <= 0 or mu2_min <= 0 or mu2_max <= 0:
+            messagebox.showwarning("参数错误", "步长范围必须大于 0。")
+            return
+        if mu1_min > mu1_max or mu2_min > mu2_max:
+            messagebox.showwarning("参数错误", "步长范围的最小值不能大于最大值。")
+            return
+
+        self.sweep_btn.configure(state=tk.DISABLED)
+        self.sweep_status_var.set("扫描中…")
+        self._append_log("\n========== Starting LMS Coordinate Descent ==========\n", "head")
+        self.app.set_running(True)
+        self._thread = threading.Thread(target=self._sweep_thread, daemon=True)
+        self._thread.start()
+        self.after(100, self._poll)
+
+    def _sweep_thread(self):
+        try:
+            best_record, all_results = optimizer.run_lms_coordinate_search(
+                rx_file=self.rxfile_var.get().strip(),
+                datano=self.datano_var.get(),
+                seed=self.seed_var.get(),
+                snr_db=self.snr_var.get(),
+                modulation_mode=self.mod_var.get(),
+                numof_ts=self.ts_var.get(),
+                taps_range=(
+                    self.sweep_taps_min_var.get(),
+                    self.sweep_taps_max_var.get(),
+                    self.sweep_taps_step_var.get(),
+                ),
+                mu1_range=(
+                    float(self.sweep_mu1_min_var.get()),
+                    float(self.sweep_mu1_max_var.get()),
+                    self.sweep_mu1_points_var.get(),
+                ),
+                mu2_range=(
+                    float(self.sweep_mu2_min_var.get()),
+                    float(self.sweep_mu2_max_var.get()),
+                    self.sweep_mu2_points_var.get(),
+                ),
+                mu_scale=self.sweep_mu_scale_var.get(),
+                initial_taps=self.taps_var.get(),
+                initial_mu1=self.mu1_var.get(),
+                initial_mu2=self.mu2_var.get(),
+                log=lambda msg: self._queue.put(("log", msg)),
+            )
+            # 保存完整扫描结果 CSV
+            import csv
+            csv_path = cfg.RECORD_DIR / f"sweep_{best_record['run_id']}.csv"
+            with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=[
+                    "taps", "mu1", "mu2", "ber_band1", "ber_band2", "ber_avg", "snr_db"])
+                writer.writeheader()
+                writer.writerows(all_results)
+
+            save_record(best_record["run_id"], best_record, cfg.RECORD_DIR)
+            self._queue.put(("sweep_done", {
+                "record": best_record,
+                "csv": str(csv_path),
+                "count": len(all_results),
+            }))
+        except Exception as exc:
+            self._queue.put(("sweep_error", exc))
 
     def _stop_awg(self):
         if self._thread is not None and self._thread.is_alive():
@@ -1163,6 +1738,114 @@ class RunPanel(ttk.Frame):
         self._append_log("\n===== 停止 AWG 输出 =====\n", "head")
         threading.Thread(target=_do_stop, daemon=True).start()
         self.after(100, self._poll)
+
+    def _start_awg_output(self):
+        if self._thread is not None and self._thread.is_alive():
+            messagebox.showinfo("忙", "已有任务在运行，请等待完成。")
+            return
+        self.awg_start_btn.configure(state=tk.DISABLED)
+        self._append_log("\n===== 开始 AWG 输出 =====\n", "head")
+        self._thread = threading.Thread(target=self._start_awg_output_thread,
+                                        daemon=True)
+        self._thread.start()
+        self.after(100, self._poll)
+
+    def _start_awg_output_thread(self):
+        try:
+            awg_m8190a.start_awg_output(
+                visa_addr=self.awgaddr_var.get().strip(),
+                log=lambda msg: self._queue.put(("log", msg)),
+            )
+            self._queue.put(("start_done", None))
+        except Exception as exc:
+            self._queue.put(("start_error", exc))
+
+    def _apply_awg_output_settings(self):
+        if self._thread is not None and self._thread.is_alive():
+            messagebox.showinfo("忙", "已有任务在运行，请等待完成。")
+            return
+        self.awg_apply_btn.configure(state=tk.DISABLED)
+        self._append_log(
+            f"\n===== 应用 AWG 输出设置: {self.awgsrate_var.get()} MSa/s, "
+            f"Vpp=[{self.awgvpp_ch1_var.get():.2f}, {self.awgvpp_ch2_var.get():.2f}] =====\n",
+            "head")
+        self._thread = threading.Thread(target=self._apply_awg_output_settings_thread,
+                                        daemon=True)
+        self._thread.start()
+        self.after(100, self._poll)
+
+    def _apply_awg_output_settings_thread(self):
+        try:
+            awg_m8190a.apply_awg_output_settings(
+                sample_rate=self.awgsrate_var.get() * 1e6,
+                vpp_ch1=self.awgvpp_ch1_var.get(),
+                vpp_ch2=self.awgvpp_ch2_var.get(),
+                visa_addr=self.awgaddr_var.get().strip(),
+                log=lambda msg: self._queue.put(("log", msg)),
+            )
+            self._queue.put(("apply_done", None))
+        except Exception as exc:
+            self._queue.put(("apply_error", exc))
+
+    def _clear_awg(self):
+        if self._thread is not None and self._thread.is_alive():
+            messagebox.showinfo("忙", "已有任务在运行，请等待完成。")
+            return
+        if not messagebox.askyesno("确认清空",
+                                   "确定要清空 AWG 中的波形并停止输出吗？"):
+            return
+        self.awg_clear_btn.configure(state=tk.DISABLED)
+        self._append_log("\n===== 清空 AWG =====\n", "head")
+        self._thread = threading.Thread(target=self._clear_awg_thread,
+                                        daemon=True)
+        self._thread.start()
+        self.after(100, self._poll)
+
+    def _clear_awg_thread(self):
+        try:
+            awg_m8190a.clear_awg(
+                visa_addr=self.awgaddr_var.get().strip(),
+                log=lambda msg: self._queue.put(("log", msg)),
+            )
+            self._queue.put(("clear_done", None))
+        except Exception as exc:
+            self._queue.put(("clear_error", exc))
+
+    def _generate_awg_waveform_only(self):
+        """根据当前参数生成发射波形文件（txt + wfm），但不连接 AWG。"""
+        try:
+            datano = self.datano_var.get()
+            seed = self.seed_var.get()
+            mode = self.mod_var.get()
+            v1, v2, decimal1, decimal2 = core.generate_symbols(
+                mode, datano, seed, seed + 100)
+            tx = core.generate_tx(v1, v2)
+            run_id = generate_run_id()
+            tx1_path = cfg.TXDATA_DIR / f"txI_{run_id}.txt"
+            tx2_path = cfg.TXDATA_DIR / f"txQ_{run_id}.txt"
+            txsum_path = cfg.TXDATA_DIR / f"txsum_{run_id}.txt"
+            v1_path = cfg.TXDATA_DIR / f"v1_{run_id}.txt"
+            v2_path = cfg.TXDATA_DIR / f"v2_{run_id}.txt"
+            dec1_path = cfg.TXDATA_DIR / f"txsym_1_{run_id}.txt"
+            dec2_path = cfg.TXDATA_DIR / f"txsym_2_{run_id}.txt"
+            from utils import save_txt, write_wfm
+            save_txt(tx1_path, tx["data1"])
+            save_txt(tx2_path, tx["data2"])
+            save_txt(txsum_path, tx["tx_sum"])
+            save_txt(v1_path, v1)
+            save_txt(v2_path, v2)
+            save_txt(dec1_path, decimal1, fmt="%d")
+            save_txt(dec2_path, decimal2, fmt="%d")
+            write_wfm(tx["data1"], cfg.TXDATA_DIR / f"SuperposedPAM6_Tx1_{run_id}.wfm")
+            write_wfm(tx["data2"], cfg.TXDATA_DIR / f"SuperposedPAM6_Tx2_{run_id}.wfm")
+            self._append_log(
+                f"\n===== 仅生成波形: {run_id} =====\n"
+                f"调制={mode}, 符号数={datano}, 种子={seed}\n"
+                f"文件: txI_{run_id}.txt, txQ_{run_id}.txt (+ .wfm)\n",
+                "head")
+            self._mark_awg_out_of_sync("波形已重新生成，请下载到 AWG")
+        except Exception as exc:
+            self._append_log(f"\n生成波形失败: {exc}\n", "err")
 
     def _append_log(self, text, tag=None):
         self.log_text.configure(state=tk.NORMAL)
@@ -1191,6 +1874,20 @@ class RunPanel(ttk.Frame):
     def _run_thread(self):
         try:
             src = self.src_var.get()
+            run_id = None
+            old_record = None
+            # file 数据源时尽量复用原 run_id（从 rx_<run_id>.txt 文件名提取），不生成新 ID
+            if src == "file":
+                rx_path = Path(self.rxfile_var.get())
+                if rx_path.stem.startswith("rx_"):
+                    run_id = rx_path.stem[3:]
+                    old_json = cfg.RECORD_DIR / f"record_{run_id}.json"
+                    if old_json.is_file():
+                        try:
+                            old_record = json.loads(old_json.read_text(encoding="utf-8"))
+                        except Exception:
+                            old_record = None
+
             record = main_flow.run_experiment(
                 datano=self.datano_var.get(),
                 seed=self.seed_var.get(),
@@ -1202,9 +1899,29 @@ class RunPanel(ttk.Frame):
                 data_source=src,
                 rx_file=self.rxfile_var.get(),
                 osc_addr=self.oscaddr_var.get(),
+                osc_channel=self.oscchan_var.get(),
+                osc_dual=self.oscdual_var.get(),
+                osc_sample_rate_ms=self.oscsrate_var.get(),
+                awg_sample_rate_ms=self.awgsrate_var.get(),
                 modulation_mode=self.mod_var.get(),
+                run_id=run_id,
                 log=lambda msg: self._queue.put(("log", msg)),
             )
+
+            # file 数据源且存在旧记录时：BER 变差则不覆盖，并提示
+            if src == "file" and old_record is not None:
+                old_ber = old_record.get("ber_avg", float("inf"))
+                if record["ber_avg"] > old_ber:
+                    self._queue.put((
+                        "log",
+                        f"注意: 新 BER {record['ber_avg']:.3e} 比原记录 "
+                        f"{old_ber:.3e} 差，未覆盖原记录 (run_id={run_id})。"
+                    ))
+                    self._queue.put(("info",
+                                     f"未覆盖 {run_id}\n新 BER 比原记录差，"))
+                    self._queue.put(("done", run_id))
+                    return
+
             save_record(record["run_id"], record, cfg.RECORD_DIR)
             self._queue.put(("log",
                              f"完成: 平均 BER={record['ber_avg']:.4e} "
@@ -1228,8 +1945,10 @@ class RunPanel(ttk.Frame):
                     messagebox.showinfo("自动识别", payload)
                 elif kind == "set_oscaddr":
                     self.oscaddr_var.set(payload)
+                    _persist_addresses(osc_addr=payload)
                 elif kind == "set_awgaddr":
                     self.awgaddr_var.set(payload)
+                    _persist_addresses(awg_addr=payload)
                 elif kind == "show_dialog":
                     title, instruments = payload
                     self._show_instruments_dialog(title, instruments)
@@ -1240,9 +1959,58 @@ class RunPanel(ttk.Frame):
                 elif kind == "awg_done":
                     self._append_log("\n===== AWG 下载完成 =====\n", "head")
                     self.awg_dl_btn.configure(state=tk.NORMAL)
+                    self._mark_awg_synced()
                 elif kind == "awg_error":
                     self._append_log(f"\nAWG 错误: {payload}\n", "err")
                     self.awg_dl_btn.configure(state=tk.NORMAL)
+                elif kind == "start_done":
+                    self._append_log("\n===== AWG 已开始输出 =====\n", "head")
+                    self.awg_start_btn.configure(state=tk.NORMAL)
+                elif kind == "start_error":
+                    self._append_log(f"\nAWG 开始输出错误: {payload}\n", "err")
+                    self.awg_start_btn.configure(state=tk.NORMAL)
+                elif kind == "apply_done":
+                    self._append_log("\n===== AWG 输出设置已应用 =====\n", "head")
+                    self.awg_apply_btn.configure(state=tk.NORMAL)
+                elif kind == "apply_error":
+                    self._append_log(f"\nAWG 输出设置错误: {payload}\n", "err")
+                    self.awg_apply_btn.configure(state=tk.NORMAL)
+                elif kind == "sweep_done":
+                    rec = payload["record"]
+                    count = payload["count"]
+                    csv_path = payload["csv"]
+                    self._append_log(
+                        f"\n===== LMS 坐标下降完成 =====\n"
+                        f"共评估 {count} 组参数，最优:\n"
+                        f"  taps={rec['lms_taps']}, μ1={rec['lms_mu1']:.4e}, "
+                        f"μ2={rec['lms_mu2']:.4e}\n"
+                        f"  平均 BER={rec['ber_avg']:.4e}\n"
+                        f"  完整结果 CSV: {csv_path}\n"
+                        f"  已把最优参数写入当前 LMS 设置。\n",
+                        "head",
+                    )
+                    self.taps_var.set(int(rec["lms_taps"]))
+                    self.mu1_var.set(float(rec["lms_mu1"]))
+                    self.mu2_var.set(float(rec["lms_mu2"]))
+                    _persist_setting("LMS_TAPS", int(rec["lms_taps"]))
+                    _persist_setting("LMS_MU1", float(rec["lms_mu1"]))
+                    _persist_setting("LMS_MU2", float(rec["lms_mu2"]))
+                    self._on_done(rec["run_id"])
+                    self.sweep_status_var.set(
+                        f"最优 BER={rec['ber_avg']:.3e} (taps={rec['lms_taps']})")
+                    return
+                elif kind == "sweep_error":
+                    self._append_log(f"\nLMS 参数扫描错误: {payload}\n", "err")
+                    self.sweep_btn.configure(state=tk.NORMAL)
+                    self.sweep_status_var.set("扫描失败")
+                    self.app.set_running(False)
+                elif kind == "clear_done":
+                    self._append_log("\n===== AWG 已清空 =====\n", "head")
+                    self.awg_clear_btn.configure(state=tk.NORMAL)
+                    self._mark_awg_out_of_sync("AWG 已清空，请下载新波形")
+                elif kind == "clear_error":
+                    self._append_log(f"\nAWG 清空错误: {payload}\n", "err")
+                    self.awg_clear_btn.configure(state=tk.NORMAL)
         except queue.Empty:
             pass
         if self._thread is not None and self._thread.is_alive():
@@ -1250,6 +2018,8 @@ class RunPanel(ttk.Frame):
 
     def _on_done(self, run_id):
         self.run_btn.configure(state=tk.NORMAL)
+        self.sweep_btn.configure(state=tk.NORMAL)
+        self._update_sweep_state()
         self.app.set_running(False)
         if run_id:
             self.run_status.configure(text="测试完成 ✔")
@@ -1272,224 +2042,6 @@ class RunPanel(ttk.Frame):
         except Exception as exc:
             messagebox.showerror("绘图错误", str(exc))
             self._append_log(f"快速绘图错误: {exc}", "err")
-
-
-class ScopePanel(ttk.Frame):
-    """Tab 5: control a Keysight oscilloscope over TCP/IP (acquire & save)."""
-
-    def __init__(self, parent, app):
-        super().__init__(parent)
-        self.app = app
-        self._queue = queue.Queue()
-        self._thread: Optional[threading.Thread] = None
-        self._scope = KeysightScope()
-
-        # ── Connection card ──────────────────────────────────────────
-        conn = ttk.LabelFrame(self, text=" 连接 ")
-        conn.pack(fill=tk.X, padx=2, pady=(2, 8))
-        ttk.Label(conn, text="VISA 地址:", style="Card.TLabel"
-                  ).grid(row=0, column=0, sticky=tk.W, padx=12, pady=(10, 4))
-        self.addr_var = tk.StringVar(value=cfg.OSC_VISA_ADDR)
-        ttk.Entry(conn, textvariable=self.addr_var, width=40
-                  ).grid(row=0, column=1, sticky=tk.W, padx=(4, 4), pady=(10, 4))
-        ttk.Button(conn, text="自动识别", command=self._auto_detect
-                   ).grid(row=0, column=2, sticky=tk.W, padx=(0, 4), pady=(10, 4))
-        self.conn_btn = ttk.Button(conn, text="连接", style="Accent.TButton",
-                                   command=self._toggle_connect)
-        self.conn_btn.grid(row=0, column=3, sticky=tk.W, padx=(4, 12), pady=(10, 4))
-        self.idn_var = tk.StringVar(value="未连接")
-        ttk.Label(conn, textvariable=self.idn_var, style="DimCard.TLabel"
-                  ).grid(row=0, column=4, sticky=tk.W, padx=8, pady=(10, 4))
-
-        # ── Acquisition card ─────────────────────────────────────────
-        acq = ttk.LabelFrame(self, text=" 采集设置 ")
-        acq.pack(fill=tk.X, padx=2, pady=(2, 8))
-        ttk.Label(acq, text="通道:", style="Card.TLabel"
-                  ).grid(row=0, column=0, sticky=tk.W, padx=12, pady=(10, 4))
-        self.chan_var = tk.StringVar(value=cfg.OSC_CHANNEL)
-        ttk.Combobox(acq, textvariable=self.chan_var, state="readonly", width=10,
-                     values=["CHAN1", "CHAN2", "CHAN3", "CHAN4"]
-                     ).grid(row=0, column=1, sticky=tk.W, padx=(4, 16), pady=(10, 4))
-        ttk.Label(acq, text="采样率 (MSa/s):", style="Card.TLabel"
-                  ).grid(row=0, column=2, sticky=tk.W, padx=12, pady=(10, 4))
-        self.srate_var = tk.DoubleVar(value=cfg.OSC_SAMPLE)
-        tk.Spinbox(acq, from_=100, to=8000, increment=100,
-                   textvariable=self.srate_var, width=10
-                   ).grid(row=0, column=3, sticky=tk.W, padx=(4, 16), pady=(10, 4))
-        ttk.Label(acq, text="时基 (us):", style="Card.TLabel"
-                  ).grid(row=0, column=4, sticky=tk.W, padx=12, pady=(10, 4))
-        self.tb_var = tk.DoubleVar(value=cfg.OSC_TIMEBASE_SCALE * 1e6)
-        tk.Spinbox(acq, from_=1.0, to=1000.0, increment=5.0,
-                   textvariable=self.tb_var, width=10
-                   ).grid(row=0, column=5, sticky=tk.W, padx=(4, 16), pady=(10, 4))
-        self.acq_btn = ttk.Button(acq, text="采集并保存", style="Accent.TButton",
-                                  command=self._start_acquire)
-        self.acq_btn.grid(row=0, column=6, sticky=tk.W, padx=(8, 12), pady=(10, 4))
-        ttk.Button(acq, text="采集并入栈运行",
-                   command=self._start_acquire_and_run
-                   ).grid(row=0, column=7, sticky=tk.W, padx=(4, 12), pady=(10, 4))
-
-        # ── Log card ─────────────────────────────────────────────────
-        log_card = ttk.LabelFrame(self, text=" 运行日志 ")
-        log_card.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
-        log_frame = tk.Frame(log_card, bg=COLOR_CARD)
-        log_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
-        self.log_text = tk.Text(
-            log_frame, wrap=tk.NONE, state=tk.DISABLED, width=40,
-            font=(FONT_MONO, 9),
-            bg="#0F172A", fg="#E2E8F0", bd=0, highlightthickness=0,
-            insertbackground="#E2E8F0")
-        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        lsb = ttk.Scrollbar(log_frame, orient=tk.VERTICAL,
-                            command=self.log_text.yview)
-        lsb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.log_text.configure(yscrollcommand=lsb.set)
-        self.log_text.tag_configure("head", foreground="#22D3EE")
-        self.log_text.tag_configure("err", foreground="#F87171")
-        self._log("提示：输入 VISA 地址（如 TCPIP0::169.254.140.83::5025::SOCKET）后点击“连接”。\n",
-                  "head")
-
-    # ------------------------------------------------------------------
-    def _log(self, text: str, tag: Optional[str] = None):
-        self.log_text.configure(state=tk.NORMAL)
-        if tag:
-            self.log_text.insert(tk.END, text, tag)
-        else:
-            self.log_text.insert(tk.END, text)
-        self.log_text.see(tk.END)
-        self.log_text.configure(state=tk.DISABLED)
-
-    def _auto_detect(self):
-        """在后台线程自动识别示波器并填入地址。"""
-        self._log("正在扫描示波器...")
-
-        def _thread():
-            try:
-                candidates = instr_disc.detect_scope_candidates()
-                if not candidates:
-                    self._queue.put(("log", "未识别到示波器，请检查连接与驱动。"))
-                    self._queue.put(("info", "未找到示波器。"))
-                    return
-                addr = candidates[0]["address"]
-                self._queue.put(("set_addr", addr))
-                self._queue.put(("log", f"已识别: {addr}\n    {candidates[0]['idn']}"))
-                if len(candidates) > 1:
-                    self._queue.put(("show_dialog", candidates))
-            except Exception as exc:
-                self._queue.put(("log", f"自动识别失败: {exc}"))
-                self._queue.put(("error", f"自动识别失败: {exc}"))
-
-        threading.Thread(target=_thread, daemon=True).start()
-        self.after(100, self._poll)
-
-    def _toggle_connect(self):
-        if self._scope.is_connected:
-            self._disconnect()
-        else:
-            self._connect()
-
-    def _connect(self):
-        try:
-            self._scope = KeysightScope(self.addr_var.get().strip())
-            self._scope.connect()
-            idn = self._scope.idn()
-        except Exception as exc:
-            self._log(f"连接失败: {exc}\n", "err")
-            self._scope = KeysightScope()
-            return
-        self.idn_var.set(idn)
-        self.conn_btn.configure(text="断开")
-        self._log(f"已连接: {idn}\n", "head")
-
-    def _disconnect(self):
-        try:
-            self._scope.disconnect()
-        except Exception:
-            pass
-        self.idn_var.set("未连接")
-        self.conn_btn.configure(text="连接")
-        self._log("已断开。\n")
-
-    def _start_acquire(self, then_run: bool = False):
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self.acq_btn.configure(state=tk.DISABLED)
-        self._log("\n===== 开始采集 =====\n", "head")
-        self._thread = threading.Thread(
-            target=self._acquire_thread, args=(then_run,), daemon=True)
-        self._thread.start()
-        self.after(100, self._poll)
-
-    def _start_acquire_and_run(self):
-        self._start_acquire(then_run=True)
-
-    def _acquire_thread(self, then_run: bool):
-        try:
-            if not self._scope.is_connected:
-                self._queue.put(("log", "正在自动连接…"))
-                self._scope = KeysightScope(self.addr_var.get().strip())
-                self._scope.connect()
-                self._queue.put(("idn", self._scope.idn()))
-            self._scope.configure(self.srate_var.get() * 1e6,
-                                  self.tb_var.get() * 1e-6)
-            result = self._scope.acquire(self.chan_var.get())
-            y = result["ydata"]
-            from datetime import datetime
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = cfg.RXDATA_DIR / f"scope_{stamp}.txt"
-            np.savetxt(path, y)
-            self._queue.put(("log",
-                             f"采集完成: {result['channel']}, {len(y)} 点, "
-                             f"SRATE={1 / result['preamble']['x_increment'] / 1e6:.1f} MSa/s"))
-            self._queue.put(("log", f"已保存: {path}"))
-            self._queue.put(("acq_done", str(path)))
-        except Exception as exc:
-            self._queue.put(("error", exc))
-
-    def _poll(self):
-        try:
-            while True:
-                kind, payload = self._queue.get_nowait()
-                if kind == "log":
-                    self._log(payload + "\n")
-                elif kind == "idn":
-                    self.idn_var.set(payload)
-                    self.conn_btn.configure(text="断开")
-                    self._log(f"已连接: {payload}\n", "head")
-                elif kind == "error":
-                    self._log(f"\nError: {payload}\n", "err")
-                    self.acq_btn.configure(state=tk.NORMAL)
-                    return
-                elif kind == "info":
-                    messagebox.showinfo("自动识别", payload)
-                elif kind == "set_addr":
-                    self.addr_var.set(payload)
-                elif kind == "show_dialog":
-                    text = instr_disc.format_instrument_list(payload)
-                    win = tk.Toplevel(self)
-                    win.title("识别到的示波器")
-                    win.geometry("700x250")
-                    win.transient(self)
-                    txt = tk.Text(win, wrap=tk.NONE, font=(FONT_MONO, 9),
-                                  bg="#FAFAFA", fg=COLOR_TEXT)
-                    txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-                    txt.insert(tk.END, text)
-                    txt.configure(state=tk.DISABLED)
-                elif kind == "acq_done":
-                    self._log("===== 采集结束 =====\n", "head")
-                    self.acq_btn.configure(state=tk.NORMAL)
-                    return
-        except queue.Empty:
-            pass
-        if self._thread is not None and self._thread.is_alive():
-            self.after(100, self._poll)
-
-    def on_close(self):
-        try:
-            if self._scope is not None:
-                self._scope.disconnect()
-        except Exception:
-            pass
 
 
 class SuperpositionGuiApp(tk.Tk):
@@ -1576,13 +2128,9 @@ class SuperpositionGuiApp(tk.Tk):
         self.notebook.add(tab4, text="  ▶ 运行测试  ")
         self.panel_run = tab4
 
-        tab5 = ScopePanel(self.notebook, self)
-        self.notebook.add(tab5, text="  📟 示波器  ")
-        self.panel_scope = tab5
-
-        tab6 = DualKeithley2400Panel(self.notebook, self)
-        self.notebook.add(tab6, text="  ⚡ 源表 (3x2400)  ")
-        self.panel_smu = tab6
+        tab5 = DualKeithley2400Panel(self.notebook, self)
+        self.notebook.add(tab5, text="  ⚡ 源表 (3x2400)  ")
+        self.panel_smu = tab5
 
         self.notebook.select(3)
 
@@ -1648,11 +2196,14 @@ class SuperpositionGuiApp(tk.Tk):
             self.run_var.set(run_id)
         rec = self._record_by_run.get(run_id)
         if rec:
+            rate = rec.get('data_rate_mbps', 0)
+            rate_str = f"{rate:.0f} Mbps" if rate else "N/A"
             self.metrics_var.set(
                 f"模式 {rec.get('modulation_mode', 'superposed')} | "
                 f"符号数 {rec.get('datano', '-')} | "
                 f"种子 {rec.get('seed', '-')} | "
                 f"SNR {rec.get('snr_db', 0):.1f} dB | "
+                f"速率 {rate_str} | "
                 f"带1 BER {rec.get('ber_band1', 0):.3e} | "
                 f"带2 BER {rec.get('ber_band2', 0):.3e} | "
                 f"平均 BER {rec.get('ber_avg', 0):.3e} | "
@@ -1719,10 +2270,14 @@ class SuperpositionGuiApp(tk.Tk):
                                  else tk.DISABLED)
 
     def _on_close(self):
-        """Clean up the oscilloscope and source-meter connections before exit."""
+        """Clean up the source-meter connections and persist addresses before exit."""
         try:
-            if hasattr(self, "panel_scope"):
-                self.panel_scope.on_close()
+            _persist_addresses(
+                osc_addr=self.panel_run.oscaddr_var.get(),
+                awg_addr=self.panel_run.awgaddr_var.get(),
+                osc_channel=self.panel_run.oscchan_var.get(),
+                osc_dual=self.panel_run.oscdual_var.get(),
+            )
         except Exception:
             pass
         try:

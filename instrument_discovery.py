@@ -10,10 +10,12 @@ from typing import List, Optional, Tuple
 
 import pyvisa
 
+import config as cfg
+
 
 # list_resources() 在某些系统（PyVISA-py + TCPIP 扫描）下可能挂起，
 # 因此用独立子进程加超时保护。
-_RESOURCE_DISCOVERY_TIMEOUT = 6.0  # 秒
+_RESOURCE_DISCOVERY_TIMEOUT = 3.0  # 秒
 
 
 # 厂商关键字 / ID（用于资源字符串或 *IDN? 返回）
@@ -141,19 +143,93 @@ def identify_resource(addr: str, timeout_ms: int = 1500) -> Optional[dict]:
     }
 
 
-def scan_instruments(timeout_ms: int = 1500,
+def _configured_addresses() -> List[str]:
+    """返回配置文件中硬编码的示波器 / AWG 地址，作为自动识别的保底候选。"""
+    addrs = []
+    for addr in (cfg.OSC_VISA_ADDR, cfg.AWG_VISA_ADDR):
+        if addr and isinstance(addr, str):
+            addrs.append(addr)
+    return addrs
+
+
+def _is_scope(info: dict) -> bool:
+    text = f"{info['vendor']} {info['model']}".upper()
+    return any(kw in text for kw in SCOPE_KEYWORDS)
+
+
+def _is_awg(info: dict) -> bool:
+    text = f"{info['vendor']} {info['model']}".upper()
+    return any(kw in text for kw in AWG_KEYWORDS)
+
+
+def _is_reachable(addr: str, timeout: float = 0.3) -> bool:
+    """对 TCPIP 地址做快速 TCP 连通性探测，避免 VISA 打开不可达地址时长时间挂起。"""
+    if not addr.upper().startswith("TCPIP"):
+        return True
+    try:
+        parts = addr.split("::")
+        # TCPIP[board]::host::port::SOCKET
+        if len(parts) >= 4:
+            host = parts[1]
+            port = int(parts[2])
+            import socket
+            sock = socket.create_connection((host, port), timeout=timeout)
+            sock.close()
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _quick_identify(addrs: List[str], timeout_ms: int = 800) -> List[dict]:
+    """对给定地址做快速识别，用于优先确认用户已填写/配置的地址。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    addrs = [a for a in addrs if a and _is_reachable(a)]
+    if not addrs:
+        return []
+    found = []
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(identify_resource, addr, timeout_ms)
+                   for addr in addrs]
+        for future in futures:
+            info = future.result()
+            if info is not None:
+                found.append(info)
+    return found
+
+
+def scan_instruments(timeout_ms: int = 1000,
                        max_workers: int = 4,
-                       include_asrl: bool = True) -> List[dict]:
+                       include_asrl: bool = False,
+                       extra_addrs: Optional[List[str]] = None,
+                       include_configured: bool = True) -> List[dict]:
     """扫描所有 VISA 资源并尝试识别，返回可连接仪器的列表（并行识别）。
 
     Parameters
     ----------
     include_asrl : bool
-        是否包含串口（ASRL）资源。自动识别时设为 False 可显著加快速度。
+        是否包含串口（ASRL）资源。自动识别时默认排除，可显著加快速度。
+    extra_addrs : list[str] | None
+        额外需要尝试的 VISA 地址（例如用户当前在 GUI 输入框中填写的地址）。
+    include_configured : bool
+        是否把 config.py 中硬编码的 OSC/AWG 地址加入候选。
     """
     from concurrent.futures import ThreadPoolExecutor
 
     resources = list_visa_resources()
+
+    # 把配置地址和 GUI 传入的地址也加入候选，避免 pyvisa 枚举不到 TCPIP 设备
+    extras = list(extra_addrs or [])
+    if include_configured:
+        extras += _configured_addresses()
+    seen = set(resources)
+    for addr in extras:
+        if addr and addr not in seen:
+            resources.append(addr)
+            seen.add(addr)
+
+    # 默认跳过串口，避免打开不存在的 COM 口导致超时
     if not include_asrl:
         resources = [r for r in resources if not r.upper().startswith("ASRL")]
     found = []
@@ -167,32 +243,52 @@ def scan_instruments(timeout_ms: int = 1500,
     return found
 
 
-def detect_scope_candidates(timeout_ms: int = 1500,
-                            include_asrl: bool = False) -> List[dict]:
+def detect_scope_candidates(timeout_ms: int = 1000,
+                            include_asrl: bool = False,
+                            extra_addrs: Optional[List[str]] = None) -> List[dict]:
     """返回识别到的示波器候选列表。"""
+    # 快速路径：优先尝试用户输入的地址 + 配置文件地址
+    quick_addrs = list(extra_addrs or []) + _configured_addresses()
+    quick_candidates = [info for info in _quick_identify(quick_addrs, timeout_ms=min(800, timeout_ms))
+                        if _is_scope(info)]
+    if quick_candidates:
+        return quick_candidates
+
+    # 兜底路径：完整扫描系统资源
     candidates = []
-    for info in scan_instruments(timeout_ms, include_asrl=include_asrl):
-        text = f"{info['vendor']} {info['model']}".upper()
-        if any(kw in text for kw in SCOPE_KEYWORDS):
+    for info in scan_instruments(timeout_ms, include_asrl=include_asrl,
+                                  extra_addrs=extra_addrs,
+                                  include_configured=False):
+        if _is_scope(info):
             candidates.append(info)
     return candidates
 
 
-def detect_awg_candidates(timeout_ms: int = 1500,
-                          include_asrl: bool = False) -> List[dict]:
+def detect_awg_candidates(timeout_ms: int = 1000,
+                          include_asrl: bool = False,
+                          extra_addrs: Optional[List[str]] = None) -> List[dict]:
     """返回识别到的 AWG 候选列表。"""
+    quick_addrs = list(extra_addrs or []) + _configured_addresses()
+    quick_candidates = [info for info in _quick_identify(quick_addrs, timeout_ms=min(800, timeout_ms))
+                        if _is_awg(info)]
+    if quick_candidates:
+        return quick_candidates
+
     candidates = []
-    for info in scan_instruments(timeout_ms, include_asrl=include_asrl):
-        text = f"{info['vendor']} {info['model']}".upper()
-        if any(kw in text for kw in AWG_KEYWORDS):
+    for info in scan_instruments(timeout_ms, include_asrl=include_asrl,
+                                  extra_addrs=extra_addrs,
+                                  include_configured=False):
+        if _is_awg(info):
             candidates.append(info)
     return candidates
 
 
-def auto_detect_scope(timeout_ms: int = 1500,
-                      include_asrl: bool = False) -> Optional[str]:
+def auto_detect_scope(timeout_ms: int = 1000,
+                      include_asrl: bool = False,
+                      extra_addrs: Optional[List[str]] = None) -> Optional[str]:
     """自动识别示波器地址，返回最佳候选地址；未找到返回 None。"""
-    candidates = detect_scope_candidates(timeout_ms, include_asrl=include_asrl)
+    candidates = detect_scope_candidates(timeout_ms, include_asrl=include_asrl,
+                                          extra_addrs=extra_addrs)
     if not candidates:
         return None
     # 优先级：TCPIP > USB > GPIB > SERIAL
@@ -201,10 +297,12 @@ def auto_detect_scope(timeout_ms: int = 1500,
     return candidates[0]["address"]
 
 
-def auto_detect_awg(timeout_ms: int = 1500,
-                    include_asrl: bool = False) -> Optional[str]:
+def auto_detect_awg(timeout_ms: int = 1000,
+                    include_asrl: bool = False,
+                    extra_addrs: Optional[List[str]] = None) -> Optional[str]:
     """自动识别 AWG 地址，返回最佳候选地址；未找到返回 None。"""
-    candidates = detect_awg_candidates(timeout_ms, include_asrl=include_asrl)
+    candidates = detect_awg_candidates(timeout_ms, include_asrl=include_asrl,
+                                        extra_addrs=extra_addrs)
     if not candidates:
         return None
     # 对 AWG520 优先 GPIB；其它优先 TCPIP/USB
